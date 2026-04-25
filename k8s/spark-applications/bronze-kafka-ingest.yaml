@@ -1,0 +1,67 @@
+---
+# Bronze Kafka streaming — long-running.
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: bronze-kafka-ingest
+  namespace: spark-jobs
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: lab08/spark:3.5.8-hudi-1.1.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: "local:///opt/spark/jobs/bronze_kafka_ingest.py"
+  arguments:
+    - "kafka.ijklmn.xyz:9092"
+    - "lab08_transactions"
+    - "earliest"
+  sparkVersion: "3.5.8"
+  restartPolicy:
+    type: Always
+    onFailureRetries: 10
+    onFailureRetryInterval: 30
+    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetryInterval: 30
+  sparkConf:
+    "spark.sql.catalogImplementation": "hive"
+    "spark.sql.warehouse.dir": "s3a://warehouse/"
+    "spark.sql.extensions": "org.apache.spark.sql.hudi.HoodieSparkSessionExtension"
+    "spark.serializer": "org.apache.spark.serializer.KryoSerializer"
+    "spark.kryo.registrator": "org.apache.spark.HoodieSparkKryoRegistrar"
+    "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.hudi.catalog.HoodieCatalog"
+    "spark.hadoop.hive.metastore.uris": "thrift://hive-metastore.data-platform.svc.cluster.local:9083"
+    "spark.hadoop.fs.s3a.endpoint": "http://minio.storage.svc.cluster.local"
+    "spark.hadoop.fs.s3a.access.key": "minioadmin"
+    "spark.hadoop.fs.s3a.secret.key": "minioadmin123"
+    "spark.hadoop.fs.s3a.path.style.access": "true"
+    "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
+    "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+    "spark.kubernetes.namespace": "spark-jobs"
+    # Очистка executor-подов сразу после завершения/перезапуска
+    "spark.kubernetes.executor.deleteOnTermination": "true"
+    "spark.sql.streaming.checkpointLocation": "s3a://hudi/.checkpoints/bronze-kafka"
+  driver:
+    cores: 1
+    coreLimit: "2000m"
+    memory: "1g"
+    serviceAccount: spark
+    labels:
+      app: bronze-kafka-ingest
+    volumeMounts:
+      - name: jobs-code
+        mountPath: /opt/spark/jobs
+  executor:
+    cores: 1
+    instances: 1
+    memory: "1g"
+    labels:
+      app: bronze-kafka-ingest
+    volumeMounts:
+      - name: jobs-code
+        mountPath: /opt/spark/jobs
+  volumes:
+    - name: jobs-code
+      configMap:
+        name: spark-jobs-code

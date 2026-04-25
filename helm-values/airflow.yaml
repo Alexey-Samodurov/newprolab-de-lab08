@@ -1,0 +1,183 @@
+# Apache Airflow с KubernetesExecutor. dbt запускается через Cosmos.
+# https://airflow.apache.org/docs/helm-chart/stable/index.html
+executor: KubernetesExecutor
+
+airflowVersion: "2.10.4"
+
+defaultAirflowTag: "2.10.4"
+
+# DAG-и доставляются через S3-синхронизацию из MinIO bucket `s3://artifacts/dags/`:
+#   - initContainer `dag-init`     — одноразовый pull при старте pod-а (нужен и worker-ам).
+#   - sidecar `dag-sync`           — `mc mirror --watch` держит /opt/airflow/dags в актуальном
+#                                    состоянии в долгоживущих pod-ах (scheduler/webserver/triggerer).
+#   - emptyDir `dags`              — общий volume между init/sidecar/основным контейнером.
+# `make airflow-dags` льёт файлы в S3 через mc job → sidecar мгновенно их синкает.
+dags:
+  persistence:
+    enabled: false
+  gitSync:
+    enabled: false
+
+postgresql:
+  enabled: true
+  image:
+    repository: bitnamilegacy/postgresql
+  primary:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+
+redis:
+  enabled: false  # KubernetesExecutor не нуждается в Redis
+
+extraEnv: |
+  - name: AIRFLOW__CORE__LOAD_EXAMPLES
+    value: "False"
+  - name: AIRFLOW__KUBERNETES_EXECUTOR__NAMESPACE
+    value: "data-platform"
+  # Чаще пересканировать /opt/airflow/dags — sidecar dag-sync подкладывает файлы
+  # каждые 15 сек, и без этого настройки scheduler ждал бы default 300 сек.
+  - name: AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL
+    value: "30"
+  - name: AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL
+    value: "15"
+  # Удалённое логирование в MinIO — логи постоянны, видны в UI после удаления пода
+  - name: AIRFLOW__LOGGING__REMOTE_LOGGING
+    value: "True"
+  - name: AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER
+    value: "s3://artifacts/airflow-logs"
+  - name: AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID
+    value: "minio_s3"
+  - name: AIRFLOW__LOGGING__ENCRYPT_S3_LOGS
+    value: "False"
+  # Connection minio_s3: AWS-провайдер с endpoint_url MinIO. URI-формат для AIRFLOW_CONN_*.
+  # Используется для remote logging и любыми DAG-ами через S3Hook("minio_s3").
+  - name: AIRFLOW_CONN_MINIO_S3
+    value: "aws://minioadmin:minioadmin123@/?endpoint_url=http%3A%2F%2Fminio.storage.svc.cluster.local&region_name=us-east-1"
+  # Connection trino_default: используется PythonSensor'ом в transactions_pipeline,
+  # чтобы дождаться появления rows в hudi.bronze.transactions перед dbt.
+  - name: AIRFLOW_CONN_TRINO_DEFAULT
+    value: "trino://airflow@trino.data-platform.svc.cluster.local:8080/hudi"
+
+# Доп. провайдеры предзашиты в кастомном образе lab08/airflow:2.10.4-cosmos
+images:
+  airflow:
+    repository: lab08/airflow
+    tag: 2.10.4-cosmos
+    pullPolicy: IfNotPresent
+
+createUserJob:
+  useHelmHooks: false
+  applyCustomEnv: false
+
+migrateDatabaseJob:
+  useHelmHooks: false
+  applyCustomEnv: false
+
+# === DAG sync из S3 (MinIO) ===
+_dagsExtraVolumes: &dagsExtraVolumes
+  - name: dags
+    emptyDir: {}
+
+_dagsExtraVolumeMounts: &dagsExtraVolumeMounts
+  - name: dags
+    mountPath: /opt/airflow/dags
+
+# initContainer выполняет одноразовый pull. Используется на всех pod-ах включая worker-ы.
+_dagsInitContainers: &dagsInitContainers
+  - name: dag-init
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    env:
+      - name: MC_CONFIG_DIR
+        value: /tmp/.mc
+      - name: HOME
+        value: /tmp
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mc alias set minio http://minio.storage.svc.cluster.local minioadmin minioadmin123
+        mkdir -p /opt/airflow/dags
+        # mc mirror создаёт пустой каталог если bucket/prefix отсутствует
+        mc mirror --overwrite --remove minio/artifacts/dags /opt/airflow/dags || true
+        ls -R /opt/airflow/dags
+    volumeMounts:
+      - name: dags
+        mountPath: /opt/airflow/dags
+
+# sidecar для долгоживущих компонентов: следит за изменениями в S3 и зеркалит их.
+_dagsSyncSidecar: &dagsSyncSidecar
+  - name: dag-sync
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    env:
+      - name: MC_CONFIG_DIR
+        value: /tmp/.mc
+      - name: HOME
+        value: /tmp
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mc alias set minio http://minio.storage.svc.cluster.local minioadmin minioadmin123
+        # Периодический sync каждые 15 секунд (mc mirror --watch требует bucket notifications)
+        while true; do
+          mc mirror --overwrite --remove minio/artifacts/dags /opt/airflow/dags >/dev/null 2>&1 || true
+          sleep 15
+        done
+    volumeMounts:
+      - name: dags
+        mountPath: /opt/airflow/dags
+
+scheduler:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 2Gi
+  extraVolumes: *dagsExtraVolumes
+  extraVolumeMounts: *dagsExtraVolumeMounts
+  extraInitContainers: *dagsInitContainers
+  extraContainers: *dagsSyncSidecar
+
+webserver:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1.5Gi
+    limits:
+      cpu: 2
+      memory: 3Gi
+  defaultUser:
+    enabled: true
+    role: Admin
+    username: admin
+    password: admin
+  extraVolumes: *dagsExtraVolumes
+  extraVolumeMounts: *dagsExtraVolumeMounts
+  extraInitContainers: *dagsInitContainers
+  extraContainers: *dagsSyncSidecar
+
+triggerer:
+  enabled: true
+  resources:
+    requests:
+      cpu: 300m
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 1.5Gi
+  extraVolumes: *dagsExtraVolumes
+  extraVolumeMounts: *dagsExtraVolumeMounts
+  extraInitContainers: *dagsInitContainers
+  extraContainers: *dagsSyncSidecar
+
+# Worker pod (KubernetesExecutor) — только initContainer, sidecar не нужен (task runs once).
+workers:
+  extraVolumes: *dagsExtraVolumes
+  extraVolumeMounts: *dagsExtraVolumeMounts
+  extraInitContainers: *dagsInitContainers

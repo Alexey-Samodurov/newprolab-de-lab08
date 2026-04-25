@@ -1,0 +1,28 @@
+# Postgres backend для Hive Metastore. HMS сам разворачивается отдельным манифестом
+# (нет официального helm chart standalone HMS под Hudi — собираем сами).
+# См. k8s/hive-metastore.yaml
+image:
+  registry: docker.io
+  repository: bitnamilegacy/postgresql
+  tag: 16.4.0-debian-12-r14
+
+auth:
+  username: hive
+  password: hive   # CHANGE in production via existingSecret
+  database: metastore
+
+primary:
+  persistence:
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Имя сервиса будет: hive-metastore-postgresql.data-platform.svc.cluster.local
+fullnameOverride: hive-metastore-postgresql
+
+primary.service.ports.postgresql: 5432

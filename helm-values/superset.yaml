@@ -1,0 +1,74 @@
+# Apache Superset, подключение к Trino.
+# https://github.com/apache/superset/tree/master/helm/superset
+image:
+  repository: apache/superset
+  tag: 4.0.1
+  pullPolicy: IfNotPresent
+
+init:
+  adminUser:
+    username: admin
+    firstname: Admin
+    lastname: User
+    email: admin@lab08.local
+    password: admin   # CHANGE for production
+
+bootstrapScript: |
+  #!/bin/bash
+  pip install sqlalchemy-trino==0.5.0
+  if ! command -v nc > /dev/null; then
+    apt-get update && apt-get install -y --no-install-recommends netcat-openbsd
+  fi
+
+postgresql:
+  enabled: true
+  image:
+    repository: bitnamilegacy/postgresql
+  primary:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+redis:
+  enabled: true
+  image:
+    repository: bitnamilegacy/redis
+  master:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+supersetNode:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 2
+      memory: 4Gi
+
+supersetWorker:
+  resources:
+    requests:
+      cpu: 300m
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 2Gi
+
+extraSecretEnv:
+  SUPERSET_SECRET_KEY: "CHANGE_ME_IN_PRODUCTION"
+
+# Регистрируем Trino как database в init scripts
+extraConfigs:
+  import_datasources.yaml: |
+    databases:
+      - database_name: hudi_via_trino
+        sqlalchemy_uri: trino://admin@trino.data-platform.svc.cluster.local:8080/hudi
+        cache_timeout: 60
+        expose_in_sqllab: true

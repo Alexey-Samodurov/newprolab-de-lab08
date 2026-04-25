@@ -1,0 +1,77 @@
+---
+# Job для разового запуска dbt (run + test). Используется для проверки.
+# В проде запускается через Airflow Cosmos.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dbt-run
+  namespace: spark-jobs
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: dbt-run
+    spec:
+      restartPolicy: Never
+      serviceAccountName: spark
+      containers:
+        - name: dbt
+          image: lab08/spark:3.5.8-hudi-1.1.1
+          imagePullPolicy: IfNotPresent
+          workingDir: /tmp/dbt-project
+          env:
+            - name: DBT_PROFILES_DIR
+              value: /tmp/dbt-project
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /tmp/dbt-project && cd /tmp/dbt-project
+              # Раскладываем файлы из flat configmap в нормальную структуру dbt
+              mkdir -p models/silver models/gold tests
+              cp /tmp/cm/dbt_project.yml .
+              cp /tmp/cm/profiles.yml .
+              cp /tmp/cm/sources.yml models/sources.yml
+              for f in /tmp/cm/silver_*.sql; do
+                bn=$(basename "$f" | sed 's/^silver_//')
+                cp "$f" "models/silver/$bn"
+              done
+              cp /tmp/cm/silver__silver.yml models/silver/_silver.yml
+              for f in /tmp/cm/gold_*.sql; do
+                bn=$(basename "$f" | sed 's/^gold_//')
+                cp "$f" "models/gold/$bn"
+              done
+              cp /tmp/cm/gold__gold.yml models/gold/_gold.yml
+              for f in /tmp/cm/test_*.sql; do
+                bn=$(basename "$f" | sed 's/^test_//')
+                cp "$f" "tests/$bn"
+              done
+              echo "--- dbt project layout ---"
+              find . -type f | sort
+              echo "--- dbt debug (git missing is OK) ---"
+              dbt debug --no-version-check || true
+              echo "--- dbt run silver ---"
+              dbt run --no-version-check --select silver
+              echo "--- dbt run gold ---"
+              dbt run --no-version-check --select gold
+              echo "--- dbt test ---"
+              dbt test --no-version-check
+          volumeMounts:
+            - name: cm
+              mountPath: /tmp/cm
+            - name: workdir
+              mountPath: /tmp/dbt-project
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+      volumes:
+        - name: cm
+          configMap:
+            name: dbt-project
+        - name: workdir
+          emptyDir: {}

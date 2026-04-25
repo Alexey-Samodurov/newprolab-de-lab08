@@ -1,0 +1,45 @@
+# MinIO Tenant — локальное S3-совместимое хранилище для Hudi data lake.
+# https://github.com/minio/operator/tree/master/helm/tenant
+tenant:
+  name: lab08
+  configuration:
+    name: lab08-env-configuration
+  configSecret:
+    name: lab08-env-configuration
+    # existingSecret: true — секрет создаётся из k8s/secrets.yaml ДО helmfile sync,
+    # helm chart НЕ перезаписывает его своими значениями.
+    existingSecret: true
+    # При existingSecret=true accessKey/secretKey ДОЛЖНЫ быть пустыми, иначе chart
+    # падает с "cannot set access-key when an existing secret is used".
+    accessKey: ""
+    secretKey: ""
+  pools:
+    - servers: 1
+      name: pool-0
+      volumesPerServer: 1
+      size: 20Gi
+      # storageClassName подставится из default StorageClass kind/Docker Desktop
+      resources:
+        requests:
+          cpu: 200m
+          memory: 1Gi
+        limits:
+          cpu: 1
+          memory: 2Gi
+  certificate:
+    requestAutoCert: false
+  buckets:
+    - name: hudi          # bronze/silver/gold таблицы (legacy путь, Hudi tables писались сюда раньше)
+    - name: lake          # bronze/silver/gold Hudi tables (актуальный s3a://lake/...)
+    - name: warehouse     # HMS warehouse директория
+    - name: checkpoints   # streaming чекпойнты
+    - name: artifacts     # spark logs, dbt manifests, airflow remote logs
+  features:
+    bucketDNS: false
+    domains: {}
+
+ingress:
+  api:
+    enabled: false
+  console:
+    enabled: false

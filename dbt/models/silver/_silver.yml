@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: transactions_clean
+    description: "Дедуплицированные транзакции с флагами качества."
+    columns:
+      - name: composite_pk
+        tests: [not_null, unique]
+      - name: transaction_id
+        tests: [not_null]
+      - name: event_day
+        tests: [not_null]
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['completed', 'pending', 'failed', 'cancelled']
+              config:
+                severity: warn
+
+  - name: cancellations_clean
+    columns:
+      - name: cancellation_id
+        tests: [not_null, unique]
+
+  - name: exchange_rates_daily
+    columns:
+      - name: rate_day
+        tests: [not_null, unique]
+      - name: rate_tgrk_punk
+        tests: [not_null]
+      - name: rate_tgrk_rub
+        tests: [not_null]

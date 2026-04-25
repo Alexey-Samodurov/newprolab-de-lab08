@@ -1,0 +1,79 @@
+---
+# Bronze S3 streaming — long-running. Полностью заменяет batch bronze-ingest.
+# 4 параллельных file-source стрима в одной JVM (transactions, cancellations,
+# exchange_rates, reference) → Hudi upsert в bronze.* через foreachBatch.
+# Чекпойнты живут на s3a://hudi/.checkpoints/bronze-s3-stream/* — рестарт
+# SparkApplication (restartPolicy: Always) не теряет offset.
+#
+# Источники raw-данных:
+#   * lab / local: s3a://lake/raw  ← заполняется `make seed-data` в локальный MinIO
+#   * production:  s3a://npl-lab08 ← публичный Yandex Object Storage; для него
+#       нужно вернуть per-bucket override на endpoint storage.yandexcloud.net
+#       и сменить argument ниже.
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: bronze-s3-streaming
+  namespace: spark-jobs
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: lab08/spark:3.5.8-hudi-1.1.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: "local:///opt/spark/jobs/bronze_s3_streaming.py"
+  arguments:
+    - "s3a://lake/raw"
+    - "s3a://hudi/.checkpoints/bronze-s3-stream"
+  sparkVersion: "3.5.8"
+  restartPolicy:
+    type: Always
+    onFailureRetries: 10
+    onFailureRetryInterval: 30
+    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetryInterval: 30
+  sparkConf:
+    "spark.sql.catalogImplementation": "hive"
+    "spark.sql.warehouse.dir": "s3a://warehouse/"
+    "spark.sql.extensions": "org.apache.spark.sql.hudi.HoodieSparkSessionExtension"
+    "spark.serializer": "org.apache.spark.serializer.KryoSerializer"
+    "spark.kryo.registrator": "org.apache.spark.HoodieSparkKryoRegistrar"
+    "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.hudi.catalog.HoodieCatalog"
+    "spark.hadoop.hive.metastore.uris": "thrift://hive-metastore.data-platform.svc.cluster.local:9083"
+    "spark.hadoop.fs.s3a.endpoint": "http://minio.storage.svc.cluster.local"
+    "spark.hadoop.fs.s3a.access.key": "minioadmin"
+    "spark.hadoop.fs.s3a.secret.key": "minioadmin123"
+    "spark.hadoop.fs.s3a.path.style.access": "true"
+    "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
+    "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+    "spark.kubernetes.namespace": "spark-jobs"
+    "spark.kubernetes.executor.deleteOnTermination": "true"
+    # Для lab нам достаточно generic MinIO config выше — `lake` тот же кластер.
+    # Для production-YC раскомментируй per-bucket override на storage.yandexcloud.net
+    # и поменяй mainApplicationFile arg на "s3a://npl-lab08".
+    # 4 стрима в одной JVM → подними кол-во ядер драйвера, чтобы они шли реально параллельно.
+    "spark.sql.streaming.numRecentProgressUpdates": "20"
+  driver:
+    cores: 1
+    coreLimit: "2000m"
+    memory: "1g"
+    serviceAccount: spark
+    labels:
+      app: bronze-s3-streaming
+    volumeMounts:
+      - name: jobs-code
+        mountPath: /opt/spark/jobs
+  executor:
+    cores: 1
+    instances: 1
+    memory: "1g"
+    labels:
+      app: bronze-s3-streaming
+    volumeMounts:
+      - name: jobs-code
+        mountPath: /opt/spark/jobs
+  volumes:
+    - name: jobs-code
+      configMap:
+        name: spark-jobs-code

@@ -1,0 +1,110 @@
+# Декларативная инсталляция всей инфраструктуры lab08.
+# Использование:
+#   helmfile sync          - первичная установка / синхронизация всех релизов
+#   helmfile -l name=trino sync   - выборочно по релизу
+#   helmfile destroy       - снести всё
+#
+# Порядок установки управляется через `needs` (helmfile сам строит DAG).
+
+repositories:
+  - name: minio-operator
+    url: https://operator.min.io
+  - name: spark-operator
+    url: https://kubeflow.github.io/spark-operator
+  - name: apache-airflow
+    url: https://airflow.apache.org
+  - name: trino
+    url: https://trinodb.github.io/charts
+  - name: superset
+    url: https://apache.github.io/superset
+  - name: bitnami
+    url: https://charts.bitnami.com/bitnami
+  - name: ingress-nginx
+    url: https://kubernetes.github.io/ingress-nginx
+
+releases:
+  # ==== Ingress ====
+  - name: ingress-nginx
+    namespace: ingress-nginx
+    chart: ingress-nginx/ingress-nginx
+    version: "4.11.0"
+    createNamespace: true
+    values:
+      - helm-values/ingress-nginx.yaml
+  # ==== Storage ====
+  - name: minio-operator
+    namespace: minio-operator
+    chart: minio-operator/operator
+    version: "6.0.4"
+    createNamespace: true
+
+  - name: minio-tenant
+    namespace: storage
+    chart: minio-operator/tenant
+    version: "6.0.4"
+    needs:
+      - minio-operator/minio-operator
+    values:
+      - helm-values/minio-tenant.yaml
+
+  # ==== Catalog ====
+  # Postgres backend для Hive Metastore. Сам HMS — k8s manifest (k8s/hive-metastore.yaml),
+  # применяется через `make hms` после установки чартов.
+  - name: hive-metastore-postgres
+    namespace: data-platform
+    chart: bitnami/postgresql
+    version: "15.5.38"
+    values:
+      - helm-values/hms-postgres.yaml
+
+  # ==== Compute / Orchestration ====
+  - name: spark-operator
+    namespace: data-platform
+    chart: spark-operator/spark-operator
+    version: "1.4.6"
+    # Webhook cert (data-platform/spark-operator-webhook-certs) генерируется helm hook'ом при первой установке,
+    # после чего его field-manager — `spark-operator` (k8s job), а не `helm`. На повторном sync helm SSA
+    # падает с conflicts. Pre-sync удаляем чтобы upgrade перевыдал свежий.
+    hooks:
+      - events: ["presync"]
+        showlogs: true
+        command: "kubectl"
+        args:
+          - "-n"
+          - "data-platform"
+          - "delete"
+          - "secret"
+          - "spark-operator-webhook-certs"
+          - "--ignore-not-found"
+    values:
+      - helm-values/spark-operator.yaml
+
+  - name: airflow
+    namespace: data-platform
+    chart: apache-airflow/airflow
+    version: "1.15.0"  # app v2.10.x
+    needs:
+      - data-platform/spark-operator
+      - ingress-nginx/ingress-nginx
+    values:
+      - helm-values/airflow.yaml
+
+  # ==== Query / BI ====
+  - name: trino
+    namespace: data-platform
+    chart: trino/trino
+    version: "0.34.0"  # app >= 470
+    needs:
+      - data-platform/hive-metastore-postgres
+    values:
+      - helm-values/trino.yaml
+
+  - name: superset
+    namespace: data-platform
+    chart: superset/superset
+    version: "0.13.2"
+    needs:
+      - data-platform/trino
+      - ingress-nginx/ingress-nginx
+    values:
+      - helm-values/superset.yaml

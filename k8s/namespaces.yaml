@@ -1,0 +1,21 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data-platform
+  labels:
+    purpose: shared-infrastructure
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark-jobs
+  labels:
+    purpose: spark-workloads
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage
+  labels:
+    purpose: minio-tenant

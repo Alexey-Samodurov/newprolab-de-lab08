@@ -1,0 +1,22 @@
+# Spark Operator (kubeflow). Watches SparkApplication CRD across namespaces.
+# https://github.com/kubeflow/spark-operator/tree/master/charts/spark-operator-chart
+spark:
+  jobNamespaces:
+    - spark-jobs
+
+webhook:
+  enable: true
+  port: 9443
+
+controller:
+  workers: 5
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# RBAC создаётся автоматически для jobNamespaces

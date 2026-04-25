@@ -1,0 +1,49 @@
+version: 2
+
+sources:
+  - name: bronze
+    schema: bronze
+    description: "Сырой слой — таблицы Hudi из Spark ingest job-ов (S3 batch + Kafka stream)."
+    tables:
+      - name: transactions
+        description: "Финансовые транзакции из S3 batch."
+        columns:
+          - name: composite_pk
+            description: "transaction_id|created_at|user_id — составной ключ из-за дублей transaction_id (~5%)."
+            tests:
+              - not_null
+          - name: transaction_id
+            tests: [not_null]
+          - name: user_id
+          - name: amount
+          - name: currency
+          - name: status
+          - name: created_at
+          - name: event_day
+      - name: cancellations
+        columns:
+          - name: cancellation_id
+            tests: [not_null, unique]
+          - name: original_transaction_id
+          - name: refund_amount
+          - name: cancelled_ts
+          - name: event_day
+      - name: exchange_rates
+        columns:
+          - name: update_id
+            tests: [not_null, unique]
+          - name: timestamp
+          - name: rate_tgrk_punk
+          - name: rate_tgrk_rub
+      - name: users
+        columns:
+          - name: user_id
+            tests: [not_null, unique]
+      - name: test_users
+        columns:
+          - name: test_user_uuid
+            tests: [not_null]
+      - name: promo_codes
+        columns:
+          - name: promo_code_id
+            tests: [not_null, unique]

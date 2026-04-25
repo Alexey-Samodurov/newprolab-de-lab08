@@ -1,0 +1,51 @@
+# Trino — read-only query engine поверх Hudi через HMS catalog.
+# Требуется версия >=470 для поддержки Hudi 1.x LSM timeline.
+# https://github.com/trinodb/charts
+image:
+  tag: "476"
+
+server:
+  workers: 1
+  config:
+    query:
+      maxMemory: 2GB
+      maxMemoryPerNode: 1GB
+  exchangeManager:
+    name: filesystem
+  # Разрешаем обработку X-Forwarded-For от ingress-nginx
+  coordinatorExtraConfig: |
+    http-server.process-forwarded=true
+  workerExtraConfig: |
+    http-server.process-forwarded=true
+
+coordinator:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 2Gi
+
+worker:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 2Gi
+
+additionalCatalogs:
+  hudi: |
+    connector.name=hudi
+    hive.metastore.uri=thrift://hive-metastore.data-platform.svc.cluster.local:9083
+    fs.native-s3.enabled=true
+    s3.endpoint=http://minio.storage.svc.cluster.local
+    s3.region=us-east-1
+    s3.path-style-access=true
+    s3.aws-access-key=minioadmin
+    s3.aws-secret-key=minioadmin123
+
+service:
+  type: ClusterIP

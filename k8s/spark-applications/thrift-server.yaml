@@ -1,0 +1,161 @@
+---
+# Spark Thrift Server как обычный k8s Deployment.
+# Spark в client mode — driver = этот pod, executors поднимаются в spark-jobs namespace.
+# Cluster mode для Thrift Server не поддерживается (Spark error: "Cluster deploy mode is not applicable").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-thrift-conf
+  namespace: spark-jobs
+data:
+  spark-defaults.conf: |
+    spark.master                                  k8s://https://kubernetes.default.svc.cluster.local:443
+    spark.submit.deployMode                       client
+    spark.kubernetes.namespace                    spark-jobs
+    spark.kubernetes.container.image              lab08/spark:3.5.8-hudi-1.1.1
+    spark.kubernetes.container.image.pullPolicy   IfNotPresent
+    spark.kubernetes.authenticate.driver.serviceAccountName  spark
+    spark.kubernetes.executor.podNamePrefix       spark-thrift
+
+    spark.driver.host                             spark-thrift-driver-headless.spark-jobs.svc.cluster.local
+    spark.driver.port                             7078
+    spark.blockManager.port                       7079
+    spark.driver.memory                           1500m
+    spark.executor.cores                          1
+    spark.executor.memory                         1500m
+
+    spark.dynamicAllocation.enabled               true
+    spark.dynamicAllocation.shuffleTracking.enabled  true
+    spark.dynamicAllocation.minExecutors          1
+    spark.dynamicAllocation.maxExecutors          3
+    spark.dynamicAllocation.initialExecutors      1
+
+    spark.sql.catalogImplementation               hive
+    spark.sql.warehouse.dir                       s3a://warehouse/
+    spark.sql.extensions                          org.apache.spark.sql.hudi.HoodieSparkSessionExtension
+    spark.serializer                              org.apache.spark.serializer.KryoSerializer
+    spark.kryo.registrator                        org.apache.spark.HoodieSparkKryoRegistrar
+    spark.sql.catalog.spark_catalog               org.apache.spark.sql.hudi.catalog.HoodieCatalog
+
+    spark.hadoop.hive.metastore.uris              thrift://hive-metastore.data-platform.svc.cluster.local:9083
+    spark.hadoop.fs.s3a.endpoint                  http://minio.storage.svc.cluster.local
+    spark.hadoop.fs.s3a.access.key                minioadmin
+    spark.hadoop.fs.s3a.secret.key                minioadmin123
+    spark.hadoop.fs.s3a.path.style.access         true
+    spark.hadoop.fs.s3a.connection.ssl.enabled    false
+    spark.hadoop.fs.s3a.impl                      org.apache.hadoop.fs.s3a.S3AFileSystem
+    spark.hadoop.fs.s3a.aws.credentials.provider  org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+
+    spark.sql.hive.thriftServer.singleSession     false
+    spark.hadoop.hive.server2.thrift.port         10000
+    spark.hadoop.hive.server2.thrift.bind.host    0.0.0.0
+---
+# Headless service для driver RPC. Имя совпадает с hostname pod (subdomain),
+# что даёт стабильный DNS spark-thrift-driver-headless.spark-jobs.svc.cluster.local.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-thrift-driver-headless
+  namespace: spark-jobs
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: spark-thrift-server
+  ports:
+    - name: driver-rpc
+      port: 7078
+      targetPort: 7078
+    - name: blockmanager
+      port: 7079
+      targetPort: 7079
+---
+# Stable Service для JDBC клиентов (dbt, Superset SQL Lab, beeline)
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-thrift-server
+  namespace: spark-jobs
+spec:
+  type: ClusterIP
+  selector:
+    app: spark-thrift-server
+  ports:
+    - name: thrift-jdbc
+      port: 10000
+      targetPort: 10000
+    - name: ui
+      port: 4040
+      targetPort: 4040
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-thrift-server
+  namespace: spark-jobs
+  labels:
+    app: spark-thrift-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: spark-thrift-server
+  template:
+    metadata:
+      labels:
+        app: spark-thrift-server
+    spec:
+      serviceAccountName: spark
+      hostname: spark-thrift-driver-headless
+      subdomain: spark-thrift-driver-headless
+      containers:
+        - name: thrift
+          image: lab08/spark:3.5.8-hudi-1.1.1
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/spark/sbin/start-thriftserver.sh"]
+          args:
+            - "--properties-file"
+            - "/opt/spark/conf/spark-defaults.conf"
+          env:
+            - name: SPARK_NO_DAEMONIZE
+              value: "true"
+            - name: SPARK_HOME
+              value: "/opt/spark"
+          ports:
+            - name: thrift-jdbc
+              containerPort: 10000
+            - name: ui
+              containerPort: 4040
+            - name: driver-rpc
+              containerPort: 7078
+            - name: blockmanager
+              containerPort: 7079
+          volumeMounts:
+            - name: conf
+              mountPath: /opt/spark/conf/spark-defaults.conf
+              subPath: spark-defaults.conf
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: 2
+              memory: 2500Mi
+          readinessProbe:
+            tcpSocket:
+              port: 10000
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 10000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 6
+      volumes:
+        - name: conf
+          configMap:
+            name: spark-thrift-conf
