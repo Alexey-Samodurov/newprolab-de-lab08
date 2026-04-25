@@ -46,11 +46,11 @@ check:
 	@kubectl get nodes
 
 ns:
-	kubectl apply -f k8s/namespaces.yaml
+	kubectl apply -f k8s/namespaces.yaml >/dev/null
 
 secrets:
 	@test -f k8s/secrets.yaml || (echo "Создай k8s/secrets.yaml из k8s/secrets.example.yaml" && exit 1)
-	kubectl apply -f k8s/secrets.yaml
+	kubectl apply -f k8s/secrets.yaml >/dev/null
 
 # Собирает spark image только если его нет (идемпотентно).
 spark-image:
@@ -74,15 +74,15 @@ images: spark-image airflow-image hms-image
 # 5. HMS deployment  6. lake bucket  7. RBAC  8. configmaps (spark-code, dbt-project)  9. Thrift Server
 # 10. Ingress  11. DAG'и + unpause  12. verify Trino
 up: ns secrets images
-	@echo ">>> Этап 1/3: Поднимаю MinIO (storage), чтобы залить DAG-и и seed-данные ДО старта Airflow"
-	helmfile -l name=minio-operator sync
-	helmfile -l name=minio-tenant sync
+	@echo ">>> [1/3] MinIO (storage)..."
+	helmfile --quiet -l name=minio-operator sync
+	helmfile --quiet -l name=minio-tenant sync
 	$(MAKE) ensure-buckets
 	$(MAKE) seed-data
 	$(MAKE) airflow-dags
-	@echo ">>> Этап 2/3: Поднимаю остальную инфраструктуру (helmfile sync — Airflow увидит DAG-и в S3 при первом старте)"
-	helmfile sync
-	@echo ">>> Ожидаю готовность hive-metastore-postgresql..."
+	@echo ">>> [2/3] Остальная инфраструктура (helmfile sync)..."
+	helmfile --quiet sync
+	@echo "    Ожидаю hive-metastore-postgresql..."
 	kubectl -n data-platform wait --for=condition=ready pod -l app.kubernetes.io/instance=hive-metastore-postgres --timeout=300s
 	$(MAKE) hms
 	$(MAKE) rbac
@@ -91,9 +91,9 @@ up: ns secrets images
 	$(MAKE) thrift
 	$(MAKE) streaming-apps
 	$(MAKE) ingress
-	@echo ">>> Ожидаю готовность Airflow scheduler..."
+	@echo "    Ожидаю Airflow scheduler..."
 	kubectl -n data-platform wait --for=condition=ready pod -l component=scheduler --timeout=300s
-	@echo ">>> Этап 3/3: bootstrap пайплайна и Superset"
+	@echo ">>> [3/3] Bootstrap пайплайна и Superset..."
 	$(MAKE) airflow-unpause
 	$(MAKE) verify-trino
 	$(MAKE) bootstrap-pipeline
@@ -110,18 +110,18 @@ up: ns secrets images
 	@echo "================================================================"
 
 hms:
-	kubectl apply -f k8s/hive-metastore.yaml
+	kubectl apply -f k8s/hive-metastore.yaml >/dev/null
 	kubectl -n data-platform rollout status deployment/hive-metastore --timeout=300s
 
 # RBAC + secrets для spark-jobs namespace и cross-ns доступа Airflow.
 rbac:
-	kubectl apply -f k8s/spark-rbac.yaml
-	kubectl apply -f k8s/spark-secrets.yaml
-	kubectl apply -f k8s/airflow-rbac.yaml
+	kubectl apply -f k8s/spark-rbac.yaml >/dev/null
+	kubectl apply -f k8s/spark-secrets.yaml >/dev/null
+	kubectl apply -f k8s/airflow-rbac.yaml >/dev/null
 
 # Spark Thrift Server (Deployment + 2 Service + configmap). Идемпотентно через kubectl apply.
 thrift:
-	kubectl apply -f k8s/spark-applications/thrift-server.yaml
+	kubectl apply -f k8s/spark-applications/thrift-server.yaml >/dev/null
 	kubectl -n spark-jobs rollout status deployment/spark-thrift-server --timeout=300s
 
 # Long-running streaming SparkApplications: bronze.* ingest из S3 (file source)
@@ -129,25 +129,23 @@ thrift:
 # Airflow ими не управляет — они живут отдельно от orchestration слоя.
 # Идемпотентно: kubectl apply, повторный запуск не пересоздаёт running app.
 streaming-apps:
-	@echo ">>> Применяю long-running streaming SparkApplications..."
-	kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml
-	kubectl apply -f k8s/spark-applications/bronze-kafka-ingest.yaml
-	@echo "    streaming SparkApps applied — Spark Operator поднимет driver pod'ы."
-	@echo "    bronze.* появится через ~1-3 мин (cold start) → следи через 'kubectl -n spark-jobs get sparkapp,pod'."
+	@echo ">>> Применяю streaming SparkApplications (S3 + Kafka)..."
+	kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
+	kubectl apply -f k8s/spark-applications/bronze-kafka-ingest.yaml >/dev/null
+	@echo "    SparkApps applied. bronze.* появится через ~1-3 мин (cold start)."
 
 # На случай если MinIO Tenant уже создан без `lake` bucket — досоздаём через mc внутри pod'а.
 # Идемпотентно: mc mb игнорирует уже существующие buckets с --ignore-existing.
 ensure-buckets:
-	@echo ">>> Проверяю / создаю buckets в MinIO..."
-	@echo "    жду появления minio pod-а..."
+	@echo ">>> Создаю/проверяю MinIO buckets..."
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12; do \
 	  if kubectl -n storage get pod -l v1.min.io/tenant=lab08 2>/dev/null | grep -q lab08; then break; fi; \
 	  sleep 5; \
 	done
-	@kubectl -n storage wait --for=condition=ready pod -l v1.min.io/tenant=lab08 --timeout=300s
+	@kubectl -n storage wait --for=condition=ready pod -l v1.min.io/tenant=lab08 --timeout=300s >/dev/null
 	@MINIO_POD=$$(kubectl -n storage get pod -l v1.min.io/tenant=lab08 -o jsonpath='{.items[0].metadata.name}'); \
 	  for b in lake hudi warehouse checkpoints artifacts; do \
-	    kubectl -n storage exec $$MINIO_POD -c minio -- sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin123 >/dev/null 2>&1 && mc mb --ignore-existing local/$$b" || true; \
+	    kubectl -n storage exec $$MINIO_POD -c minio -- sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin123 >/dev/null 2>&1 && mc mb --ignore-existing local/$$b 2>&1 | grep -v 'already exists'" || true; \
 	  done
 
 # Заливает sample/*.jsonl в s3://lake/raw/ согласно структуре, которую читает
@@ -161,7 +159,7 @@ ensure-buckets:
 # для полного reset удалить s3://hudi/.checkpoints/bronze-s3-stream/* и bronze-таблицы.
 SEED_DAYS ?= 2025-10-06 2025-10-07
 seed-data:
-	@echo ">>> Загружаю sample-данные в s3://lake/raw/"
+	@echo ">>> Загружаю sample-данные в s3://lake/raw/..."
 	@kubectl -n data-platform delete pod mc-seed --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	@kubectl -n data-platform run mc-seed \
 	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
@@ -179,14 +177,14 @@ seed-data:
 	@kubectl -n data-platform exec mc-seed -- sh -c '\
 	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
 	  for d in $(SEED_DAYS); do \
-	    mc cp /tmp/transactions-$$d.jsonl m/lake/raw/batch/day=$$d/slot=00/transactions.jsonl && \
-	    mc cp /tmp/cancellations-$$d.jsonl m/lake/raw/cancellations/day=$$d/cancellations.jsonl; \
+	    mc cp --quiet /tmp/transactions-$$d.jsonl m/lake/raw/batch/day=$$d/slot=00/transactions.jsonl && \
+	    mc cp --quiet /tmp/cancellations-$$d.jsonl m/lake/raw/cancellations/day=$$d/cancellations.jsonl; \
 	  done && \
-	  mc cp /tmp/rates.jsonl       m/lake/raw/exchange_rates/rates.jsonl && \
-	  mc cp /tmp/users.jsonl       m/lake/raw/reference/users.jsonl && \
-	  mc cp /tmp/test_users.jsonl  m/lake/raw/reference/test_users.jsonl && \
-	  mc cp /tmp/promo_codes.jsonl m/lake/raw/reference/promo_codes.jsonl && \
-	  echo "--- s3://lake/raw ---" && mc ls --recursive m/lake/raw'
+	  mc cp --quiet /tmp/rates.jsonl       m/lake/raw/exchange_rates/rates.jsonl && \
+	  mc cp --quiet /tmp/users.jsonl       m/lake/raw/reference/users.jsonl && \
+	  mc cp --quiet /tmp/test_users.jsonl  m/lake/raw/reference/test_users.jsonl && \
+	  mc cp --quiet /tmp/promo_codes.jsonl m/lake/raw/reference/promo_codes.jsonl && \
+	  echo "    s3://lake/raw: $$(mc ls --recursive m/lake/raw | wc -l) файлов"'
 	@kubectl -n data-platform delete pod mc-seed --wait=false >/dev/null 2>&1 || true
 
 diff:
@@ -237,7 +235,7 @@ clean: down
 spark-code:
 	kubectl create configmap spark-jobs-code -n spark-jobs \
 	  --from-file=spark-jobs/ \
-	  --dry-run=client -o yaml | kubectl apply -f -
+	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # Пересоздаёт ConfigMap dbt-project из dbt/ (flat layout, имена префиксированы слоем).
 # Airflow KubernetesPodOperator и k8s/dbt-job.yaml читают этот configmap.
@@ -259,11 +257,11 @@ dbt-configmap:
 	  --from-file=gold__gold.yml=dbt/models/gold/_gold.yml \
 	  --from-file=test_recon_silver_transactions_count.sql=dbt/tests/recon_silver_transactions_count.sql \
 	  --from-file=test_recon_cancellations_orphan_rate.sql=dbt/tests/recon_cancellations_orphan_rate.sql \
-	  --dry-run=client -o yaml | kubectl apply -f -
+	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # Применяет Ingress ресурсы для всех UI-сервисов (nginx-ingress должен быть запущен).
 ingress:
-	kubectl apply -f k8s/ingress.yaml
+	kubectl apply -f k8s/ingress.yaml >/dev/null
 
 # Добавляет *.lab08.local в /etc/hosts (требует sudo).
 # Идемпотентен: не дублирует строки при повторном запуске.
@@ -284,7 +282,7 @@ hosts:
 # scheduler пересканирует папку за ≤30 сек (DAG_DIR_LIST_INTERVAL).
 # Идемпотентно: --overwrite + --remove синхронизирует состояние с локальной копией.
 airflow-dags:
-	@echo ">>> Загружаю DAG-файлы в s3://artifacts/dags/"
+	@echo ">>> Загружаю DAG-файлы в s3://artifacts/dags/..."
 	@kubectl -n data-platform delete pod mc-dag-uploader --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	@kubectl -n data-platform run mc-dag-uploader \
 	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
@@ -295,13 +293,12 @@ airflow-dags:
 	@kubectl -n data-platform wait --for=condition=Ready pod/mc-dag-uploader --timeout=60s >/dev/null
 	@kubectl -n data-platform exec mc-dag-uploader -- mkdir -p /tmp/dags
 	@for f in airflow/dags/*.py; do \
-	  echo "  uploading $$f"; \
 	  kubectl -n data-platform exec -i mc-dag-uploader -- sh -c "cat > /tmp/dags/$$(basename $$f)" < $$f; \
 	done
 	@kubectl -n data-platform exec mc-dag-uploader -- sh -c '\
 	  mc alias set minio http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
-	  mc mirror --overwrite --remove /tmp/dags minio/artifacts/dags && \
-	  echo "--- s3://artifacts/dags ---" && mc ls --recursive minio/artifacts/dags'
+	  mc mirror --quiet --overwrite --remove /tmp/dags minio/artifacts/dags && \
+	  echo "    s3://artifacts/dags: $$(mc ls --recursive minio/artifacts/dags | wc -l) файлов"'
 	@kubectl -n data-platform delete pod mc-dag-uploader --wait=false >/dev/null 2>&1 || true
 
 # Снимает с паузы DAG'и проекта. Идемпотентно: повторный вызов — no-op.
@@ -322,17 +319,16 @@ airflow-unpause:
 # Проверяет что Trino отвечает и каталог hudi работает.
 verify-trino:
 	@echo ">>> Проверка Trino..."
-	@kubectl -n data-platform wait --for=condition=ready pod -l app.kubernetes.io/name=trino,app.kubernetes.io/component=coordinator --timeout=180s
+	@kubectl -n data-platform wait --for=condition=ready pod -l app.kubernetes.io/name=trino,app.kubernetes.io/component=coordinator --timeout=180s >/dev/null
 	@kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW CATALOGS" 2>/dev/null | grep -q hudi \
 	  && echo "    catalog hudi: OK" || (echo "    catalog hudi: FAIL" && exit 1)
-	@kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW SCHEMAS FROM hudi" 2>/dev/null \
-	  | tee /dev/stderr | grep -q bronze \
-	  && echo "    schema hudi.bronze: OK" || echo "    schema hudi.bronze: пока пусто (запусти make streaming-apps или make bootstrap-pipeline)"
+	@kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW SCHEMAS FROM hudi" 2>/dev/null | grep -q bronze \
+	  && echo "    schema hudi.bronze: OK" || echo "    schema hudi.bronze: пока пусто (запусти make streaming-apps)"
 	@if kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW TABLES FROM hudi.bronze" 2>/dev/null | grep -q transactions; then \
-	    echo ">>> SELECT count(*) FROM hudi.bronze.transactions:"; \
-	    kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SELECT count(*) FROM hudi.bronze.transactions" 2>&1 | tail -3; \
+	    echo -n "    bronze.transactions rows: "; \
+	    kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SELECT count(*) FROM hudi.bronze.transactions" 2>/dev/null | tail -1; \
 	  else \
-	    echo "    bronze.transactions ещё не создана — ОК (создастся после первого батча streaming SparkApp bronze-s3-streaming)"; \
+	    echo "    bronze.transactions ещё не создана (создастся после первого micro-batch)"; \
 	  fi
 
 # Запускает основной DAG вручную (bronze ждётся sensor'ом внутри DAG'а).
