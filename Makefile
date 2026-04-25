@@ -4,7 +4,6 @@
         bootstrap-pipeline seed-data streaming-apps
 
 KIND_CONTEXT ?= docker-desktop
-# Sample-данные лежат в lab08/sample/ относительно корня репозитория
 SAMPLE_DIR ?= lab08/sample
 
 help:
