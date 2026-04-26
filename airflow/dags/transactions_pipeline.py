@@ -15,14 +15,19 @@ sensor проходит мгновенно.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
+from airflow.operators.python import ShortCircuitOperator
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from airflow.sensors.python import PythonSensor
 from kubernetes.client import models as k8s
 
 NAMESPACE = "spark-jobs"
+# Если предыдущий success моложе этого порога — текущий scheduled run пропускаем.
+# Закрывает дублирующий пересчёт когда long-running run (cold-start Spark + sensor +
+# dbt ≈ 10 мин) пересекается со следующим cron-тиком */30.
+SKIP_IF_RECENT_SUCCESS_MINUTES = 25
 
 
 def _bronze_has_rows() -> bool:
@@ -82,6 +87,43 @@ def make_dbt_task(task_id: str, dbt_args: str) -> KubernetesPodOperator:
     )
 
 
+def _skip_if_recent_success(**context) -> bool:
+    """ShortCircuit: True → продолжать, False → skip downstream.
+
+    Manual runs (run_id начинается с 'manual__') всегда проходят — пользователь
+    запросил явно. Для scheduled runs смотрим на самый свежий success этого DAG'а:
+    если < SKIP_IF_RECENT_SUCCESS_MINUTES назад — пропускаем (значит предыдущий
+    long-running cycle ещё не успел "остыть", lookback в dbt всё равно покрыл
+    эти данные).
+    """
+    dag_run = context["dag_run"]
+    if dag_run.run_id.startswith("manual__"):
+        print(f"manual run ({dag_run.run_id}) — пропуск проверки, продолжаем")
+        return True
+
+    from airflow.models import DagRun
+    from airflow.utils.state import DagRunState
+
+    last_success = (
+        DagRun.find(dag_id=dag_run.dag_id, state=DagRunState.SUCCESS)
+        or []
+    )
+    last_success.sort(key=lambda r: r.end_date or r.start_date, reverse=True)
+    if not last_success:
+        print("предыдущих success run'ов нет — продолжаем")
+        return True
+
+    prev = last_success[0]
+    end = prev.end_date or prev.start_date
+    age = datetime.now(timezone.utc) - end
+    threshold = timedelta(minutes=SKIP_IF_RECENT_SUCCESS_MINUTES)
+    print(f"последний success: {prev.run_id} закончился {end}, age={age}, threshold={threshold}")
+    if age < threshold:
+        print(f"SKIP: предыдущий success моложе {SKIP_IF_RECENT_SUCCESS_MINUTES} мин")
+        return False
+    return True
+
+
 with DAG(
     dag_id="transactions_pipeline",
     description="wait bronze (streaming) → dbt silver → gold → tests",
@@ -92,6 +134,18 @@ with DAG(
     default_args={"owner": "lab08"},
     tags=["lab08", "hudi", "dbt"],
 ) as dag:
+    # ShortCircuit: пропускаем scheduled run, если предыдущий success был
+    # < SKIP_IF_RECENT_SUCCESS_MINUTES минут назад. Cron */30 + cold-start
+    # ~10 мин раньше давал 2 пересчёта подряд (15:00 и 15:30 на одних и тех
+    # же данных). Manual run от bootstrap'а всегда проходит.
+    skip_if_recent = ShortCircuitOperator(
+        task_id="skip_if_recent_success",
+        python_callable=_skip_if_recent_success,
+        # ignore_downstream_trigger_rules=False даёт downstream корректный 'skipped',
+        # а не 'upstream_failed' — DAGRun помечается success.
+        ignore_downstream_trigger_rules=False,
+    )
+
     # Sensor с mode='reschedule' освобождает worker-slot между poke,
     # чтобы первый запуск (cold-start Spark может занять до 5-10 мин)
     # не держал ресурсы. timeout=30 мин — fail-fast если streaming не поднялся.
@@ -107,5 +161,5 @@ with DAG(
     dbt_gold = make_dbt_task("dbt_gold", "run --select gold")
     dbt_test = make_dbt_task("dbt_test", "test")
 
-    wait_bronze >> dbt_silver >> dbt_gold >> dbt_test
+    skip_if_recent >> wait_bronze >> dbt_silver >> dbt_gold >> dbt_test
 

@@ -346,11 +346,11 @@ airflow-trigger-pipeline:
 # Bootstrap: гарантирует, что lab08 пройден end-to-end к моменту superset-init.
 #   1) если gold уже наполнен И последний DAGRun = success (значит dbt_test
 #      прошёл) → skip;
-#   2) иначе триггерит DAGRun (чтобы не ждать */30 cron-окна);
-#   3) ждёт state=success у этого run'а — это включает dbt_test, поэтому
-#      superset-init дальше деплоит дашборды только на провалидированные данные.
-# Идемпотентно (повторный trigger создаёт новый DAGRun, max_active_runs=1
-# отбросит лишний). Fail-on-timeout: exit 1 если за 25 мин run не завершился.
+#   2) если scheduler уже создал run (queued/running) → НЕ триггерим вручную,
+#      иначе получаем 2 параллельных run'а (manual + scheduled), которые
+#      max_active_runs=1 сериализует → пайплайн крутится дважды;
+#   3) иначе триггерим manual run (cold-start, чтобы не ждать */30 cron-окна);
+#   4) ждём state=success у самого свежего run'а — это включает dbt_test.
 bootstrap-pipeline:
 	@set -e; \
 	SCHEDULER_POD=$$(kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'); \
@@ -365,12 +365,20 @@ bootstrap-pipeline:
 	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
 	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; rs.sort(key=lambda r: r.get('execution_date',''), reverse=True); print(rs[0]['state'] if rs else '')" 2>/dev/null; \
 	}; \
+	has_active_run() { \
+	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
+	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state') in ('queued','running') for r in rs) else 1)"; \
+	}; \
 	echo ">>> bootstrap: проверяю состояние pipeline..."; \
 	if count_positive hudi.gold.transactions_by_hour && [ "$$(last_run_state)" = "success" ]; then \
 	  echo "    gold наполнен и последний DAGRun=success — skip"; exit 0; \
 	fi; \
-	echo "    pipeline не завершён — триггерю transactions_pipeline..."; \
-	af dags trigger transactions_pipeline >/dev/null 2>&1 || true; \
+	if has_active_run; then \
+	  echo "    активный DAGRun уже есть (создан scheduler'ом) — жду без manual trigger"; \
+	else \
+	  echo "    активного DAGRun нет — триггерю manual run..."; \
+	  af dags trigger transactions_pipeline >/dev/null 2>&1 || true; \
+	fi; \
 	echo ">>> жду success последнего DAGRun (до 25 мин: cold start Spark + bronze sensor + dbt silver/gold/test)..."; \
 	for i in $$(seq 1 150); do \
 	  sleep 10; \
