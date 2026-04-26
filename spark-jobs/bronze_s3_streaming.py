@@ -118,10 +118,15 @@ def handle_transactions(batch_df: DataFrame, batch_id: int) -> None:
                                   F.coalesce(F.col("created_at").cast("string"), F.lit("0")),
                                   F.coalesce(F.col("user_id").cast("string"), F.lit("0"))))
           .withColumn("ingested_at", F.current_timestamp()))
-    write_hudi(df, hudi_opts("transactions", "bronze",
-                             pk="composite_pk",
-                             partition_field="event_day",
-                             precombine="ingested_at"))
+    write_hudi(df, hudi_opts(
+        "transactions", "bronze",
+        pk="composite_pk",
+        partition_field="event_day",
+        precombine="ingested_at",
+        # column-stats: поля, по которым реально фильтруют запросы вверх по pipeline
+        # (dbt incremental WHERE event_day >=, dashboard фильтры по статусу/типу).
+        column_stats_cols="event_day,status,transaction_type,ingested_at",
+    ))
     print(f"[tx batch={batch_id}] rows={df.count()}")
 
 
@@ -133,10 +138,13 @@ def handle_cancellations(batch_df: DataFrame, batch_id: int) -> None:
           .withColumn("cancelled_ts", F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm"))
           .withColumn("event_day", F.date_format("cancelled_ts", "yyyy-MM-dd"))
           .withColumn("ingested_at", F.current_timestamp()))
-    write_hudi(df, hudi_opts("cancellations", "bronze",
-                             pk="cancellation_id",
-                             partition_field="event_day",
-                             precombine="ingested_at"))
+    write_hudi(df, hudi_opts(
+        "cancellations", "bronze",
+        pk="cancellation_id",
+        partition_field="event_day",
+        precombine="ingested_at",
+        column_stats_cols="event_day,reason,ingested_at",
+    ))
     print(f"[cancel batch={batch_id}] rows={df.count()}")
 
 
@@ -145,10 +153,16 @@ def handle_rates(batch_df: DataFrame, batch_id: int) -> None:
         print(f"[rates batch={batch_id}] empty")
         return
     df = batch_df.withColumn("ingested_at", F.current_timestamp())
-    write_hudi(df, hudi_opts("exchange_rates", "bronze",
-                             pk="update_id",
-                             partition_field="",
-                             precombine="timestamp"))
+    write_hudi(df, hudi_opts(
+        "exchange_rates", "bronze",
+        pk="update_id",
+        partition_field="",
+        precombine="timestamp",
+        # маленькая таблица: record-index не нужен (overhead > benefit),
+        # column-stats тоже минимальный.
+        column_stats_cols="timestamp",
+        enable_record_index=False,
+    ))
     print(f"[rates batch={batch_id}] rows={df.count()}")
 
 
@@ -186,8 +200,13 @@ def handle_reference(spark: SparkSession, src_root: str, batch_df: DataFrame, ba
         table, schema, pk = spec
         df = (spark.read.schema(schema).json(path)
               .withColumn("ingested_at", F.current_timestamp()))
-        write_hudi(df, hudi_opts(table, "bronze",
-                                 pk=pk, partition_field="", precombine="ingested_at"))
+        write_hudi(df, hudi_opts(
+            table, "bronze",
+            pk=pk, partition_field="", precombine="ingested_at",
+            # справочники маленькие, record-index не оправдан.
+            column_stats_cols="ingested_at",
+            enable_record_index=False,
+        ))
         print(f"[ref batch={batch_id}] upserted {table} from {fname}")
 
 
@@ -204,7 +223,7 @@ def start_file_stream(
     glob: str,
     handler,
     checkpoint: str,
-    trigger_seconds: int = 30,
+    trigger_seconds: int = 120,
     max_files_per_trigger: int = 50,
     include_source_path: bool = False,
 ):

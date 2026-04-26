@@ -53,23 +53,33 @@ def process_batch(batch_df, batch_id):
                                   F.coalesce(F.col("created_at").cast("string"), F.lit("0")),
                                   F.coalesce(F.col("user_id").cast("string"), F.lit("0"))))
           .withColumn("ingested_at", F.current_timestamp()))
-    write_hudi(tx, hudi_opts("transactions", "bronze",
-                             pk="composite_pk", partition_field="event_day",
-                             precombine="ingested_at", table_suffix="_kafka"))
+    write_hudi(tx, hudi_opts(
+        "transactions", "bronze",
+        pk="composite_pk", partition_field="event_day",
+        precombine="ingested_at", table_suffix="_kafka",
+        column_stats_cols="event_day,status,transaction_type,ingested_at",
+    ))
 
     cancel = (batch_df.filter(F.col("_source") == "cancellation")
               .withColumn("cancelled_ts", F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm"))
               .withColumn("event_day", F.date_format("cancelled_ts", "yyyy-MM-dd"))
               .withColumn("ingested_at", F.current_timestamp()))
-    write_hudi(cancel, hudi_opts("cancellations", "bronze",
-                                 pk="cancellation_id", partition_field="event_day",
-                                 precombine="ingested_at", table_suffix="_kafka"))
+    write_hudi(cancel, hudi_opts(
+        "cancellations", "bronze",
+        pk="cancellation_id", partition_field="event_day",
+        precombine="ingested_at", table_suffix="_kafka",
+        column_stats_cols="event_day,reason,ingested_at",
+    ))
 
     rates = (batch_df.filter(F.col("_source") == "exchange_rate")
              .withColumn("ingested_at", F.current_timestamp()))
-    write_hudi(rates, hudi_opts("exchange_rates", "bronze",
-                                pk="update_id", partition_field="",
-                                precombine="timestamp", table_suffix="_kafka"))
+    write_hudi(rates, hudi_opts(
+        "exchange_rates", "bronze",
+        pk="update_id", partition_field="",
+        precombine="timestamp", table_suffix="_kafka",
+        column_stats_cols="timestamp",
+        enable_record_index=False,
+    ))
 
     print(f"[batch {batch_id}] tx={tx.count()} cancel={cancel.count()} rates={rates.count()}")
     batch_df.unpersist()

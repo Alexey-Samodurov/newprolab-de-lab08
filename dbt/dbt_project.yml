@@ -11,6 +11,12 @@ macro-paths: ["macros"]
 target-path: "target"
 clean-targets: ["target", "dbt_packages"]
 
+# Hudi tuning через TBLPROPERTIES задаётся per-model: column.stats.column.list
+# должен ссылаться только на существующие в модели колонки — иначе Hudi 1.1.1
+# кидает NPE в HoodieTableMetadataUtil.getColumnsToIndexWithoutRequiredMetaFields.
+# Поэтому общие свойства (zstd/cleaner/archive/clustering/metadata) дублируются
+# в каждой модели — dbt-spark НЕ делает deep-merge tblproperties между уровнями.
+
 models:
   lab08:
     silver:
@@ -19,6 +25,54 @@ models:
       +incremental_strategy: merge
       +schema: silver
       +location_root: s3a://lake/silver
+      transactions_clean:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.clustering.inline: "true"
+          hoodie.clustering.inline.max.commits: "4"
+          hoodie.clustering.plan.strategy.target.file.max.bytes: "134217728"
+          hoodie.clustering.plan.strategy.small.file.limit: "104857600"
+          hoodie.clustering.plan.strategy.sort.columns: event_day
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: event_day,is_test_user
+      cancellations_clean:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.clustering.inline: "true"
+          hoodie.clustering.inline.max.commits: "4"
+          hoodie.clustering.plan.strategy.target.file.max.bytes: "134217728"
+          hoodie.clustering.plan.strategy.small.file.limit: "104857600"
+          hoodie.clustering.plan.strategy.sort.columns: event_day
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: event_day
+      exchange_rates_daily:
+        # Справочная мини-таблица (~365 строк/год): clustering не нужен,
+        # event_day/is_test_user в схеме нет.
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: rate_day
     gold:
       # ВАЖНО: НЕ ставить materialized=table — dbt-spark делает DROP TABLE,
       # но S3-директория остаётся → следующий CREATE склеивает старые parquet
@@ -28,6 +82,80 @@ models:
       +incremental_strategy: merge
       +schema: gold
       +location_root: s3a://lake/gold
+      # Gold-таблицы маленькие (часовые/дневные агрегаты): clustering выключен,
+      # но zstd + cleaner + column-stats полезны для дашборда (file-skipping
+      # по min/max через Trino без S3-листинга).
+      transactions_by_hour:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: event_day,hour_of_day,is_test_user
+      purchases_by_hour:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: event_day,hour_of_day
+      revenue_daily:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: event_day
+      cancellations_summary:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+          hoodie.metadata.index.column.stats.column.list: cancel_day
+      promo_codes_analysis:
+        # Маленькая (~десятки промокодов), часто фильтр по promo_code.
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
+      user_cohorts:
+        +tblproperties:
+          hoodie.parquet.compression.codec: zstd
+          hoodie.clean.policy: KEEP_LATEST_COMMITS
+          hoodie.clean.commits.retained: "2"
+          hoodie.clean.automatic: "true"
+          hoodie.clean.async.enabled: "true"
+          hoodie.keep.min.commits: "4"
+          hoodie.keep.max.commits: "5"
+          hoodie.metadata.enable: "true"
+          hoodie.metadata.index.column.stats.enable: "true"
 
 vars:
   base_currency: "TGRK"

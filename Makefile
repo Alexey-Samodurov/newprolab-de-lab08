@@ -344,36 +344,44 @@ airflow-trigger-pipeline:
 	kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags trigger transactions_pipeline
 
 # Bootstrap: гарантирует, что lab08 пройден end-to-end к моменту superset-init.
-#   1) если gold уже наполнен (count>0) → skip;
-#   2) триггерит первый DAGRun (чтобы не ждать */30 cron-окна);
-#   3) ждёт gold.transactions_by_hour rows>0 — DAG сам внутри ждёт bronze
-#      через PythonSensor, потом гонит dbt silver/gold/test.
+#   1) если gold уже наполнен И последний DAGRun = success (значит dbt_test
+#      прошёл) → skip;
+#   2) иначе триггерит DAGRun (чтобы не ждать */30 cron-окна);
+#   3) ждёт state=success у этого run'а — это включает dbt_test, поэтому
+#      superset-init дальше деплоит дашборды только на провалидированные данные.
 # Идемпотентно (повторный trigger создаёт новый DAGRun, max_active_runs=1
-# отбросит лишний). Fail-on-timeout: exit 1 если за 25 мин gold не наполнен.
+# отбросит лишний). Fail-on-timeout: exit 1 если за 25 мин run не завершился.
 bootstrap-pipeline:
 	@set -e; \
+	SCHEDULER_POD=$$(kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'); \
+	af() { kubectl -n data-platform exec $$SCHEDULER_POD -c scheduler -- airflow "$$@"; }; \
 	count_positive() { \
 	  out=$$(kubectl -n data-platform exec deploy/trino-coordinator -- \
 	         trino --execute "SELECT count(*) FROM $$1" 2>/dev/null \
 	         | tail -1 | tr -d '"' | tr -d ' '); \
 	  case "$$out" in [1-9]*) return 0 ;; *) return 1 ;; esac; \
 	}; \
-	echo ">>> bootstrap: проверяю gold-таблицы..."; \
-	if count_positive hudi.gold.transactions_by_hour; then \
-	  echo "    gold уже наполнен — skip"; exit 0; \
+	last_run_state() { \
+	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
+	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; rs.sort(key=lambda r: r.get('execution_date',''), reverse=True); print(rs[0]['state'] if rs else '')" 2>/dev/null; \
+	}; \
+	echo ">>> bootstrap: проверяю состояние pipeline..."; \
+	if count_positive hudi.gold.transactions_by_hour && [ "$$(last_run_state)" = "success" ]; then \
+	  echo "    gold наполнен и последний DAGRun=success — skip"; exit 0; \
 	fi; \
-	echo "    gold пустой — триггерю transactions_pipeline (sensor сам подождёт bronze)..."; \
-	SCHEDULER_POD=$$(kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'); \
-	kubectl -n data-platform exec $$SCHEDULER_POD -c scheduler -- airflow dags trigger transactions_pipeline >/dev/null 2>&1 || true; \
-	echo ">>> жду gold (до 25 мин: cold start Spark + первый micro-batch + sensor + dbt silver/gold/test)..."; \
+	echo "    pipeline не завершён — триггерю transactions_pipeline..."; \
+	af dags trigger transactions_pipeline >/dev/null 2>&1 || true; \
+	echo ">>> жду success последнего DAGRun (до 25 мин: cold start Spark + bronze sensor + dbt silver/gold/test)..."; \
 	for i in $$(seq 1 150); do \
 	  sleep 10; \
-	  if count_positive hudi.gold.transactions_by_hour; then \
-	    echo "    gold готов (попытка $$i/150)"; exit 0; \
-	  fi; \
-	  if [ $$((i % 6)) = 0 ]; then echo "    жду gold... ($$i/150, ~$$((i / 6)) мин)"; fi; \
+	  state=$$(last_run_state); \
+	  case "$$state" in \
+	    success) echo "    DAGRun success (попытка $$i/150) — dbt_test пройден"; exit 0 ;; \
+	    failed)  echo "ERR: DAGRun failed — проверь airflow UI: dag transactions_pipeline"; exit 1 ;; \
+	  esac; \
+	  if [ $$((i % 6)) = 0 ]; then echo "    жду DAGRun... state=$$state ($$i/150, ~$$((i / 6)) мин)"; fi; \
 	done; \
-	echo "ERR: gold не наполнен за 25 мин — посмотри SparkApplication bronze-s3-streaming, DAG transactions_pipeline"; exit 1
+	echo "ERR: DAGRun не завершился за 25 мин — посмотри SparkApplication bronze-s3-streaming, DAG transactions_pipeline"; exit 1
 
 # Инициализирует Superset: создаёт database connection (Trino), datasets, charts и dashboard.
 # Выполняется ВНУТРИ кластера: скрипт копируется в superset pod и запускается там
