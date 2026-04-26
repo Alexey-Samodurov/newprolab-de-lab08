@@ -5,10 +5,14 @@ models:
     columns:
       - name: pk
         tests: [unique, not_null]
+      - name: updated_at
+        tests: [not_null]
   - name: purchases_by_hour
     columns:
       - name: pk
         tests: [unique, not_null]
+      - name: updated_at
+        tests: [not_null]
   - name: revenue_daily
     columns:
       - name: event_day
@@ -19,6 +23,8 @@ models:
     columns:
       - name: promo_code_id
         tests: [not_null]
+      - name: updated_at
+        tests: [not_null]
   - name: cancellations_summary
     columns:
       - name: pk
@@ -26,6 +32,8 @@ models:
       - name: cancel_day
         tests: [not_null]
       - name: reason
+        tests: [not_null]
+      - name: updated_at
         tests: [not_null]
   - name: user_cohorts
     columns:
@@ -38,3 +46,5 @@ models:
           - not_null
           - accepted_values:
               values: ['new', 'returning']
+      - name: updated_at
+        tests: [not_null]

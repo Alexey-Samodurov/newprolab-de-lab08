@@ -6,7 +6,7 @@
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge',
    unique_key='pk',
-   options={'primaryKey': 'pk', 'preCombineField': 'pk', 'type': 'cow'}) }}
+   options={'primaryKey': 'pk', 'preCombineField': 'updated_at', 'type': 'cow'}) }}
 
 WITH real_tx AS (
     SELECT
@@ -22,7 +22,7 @@ WITH real_tx AS (
     WHERE is_test_user = false
       AND is_user_missing = false
     {% if is_incremental() %}
-      AND event_day >= date_sub(current_date(), 7)
+      AND event_day >= date_sub(current_date(), {{ var('transactions_lookback_days', 30) }})
     {% endif %}
 ),
 -- first_seen намеренно читает ВСЮ таблицу без incrementel-фильтра:
@@ -60,6 +60,7 @@ SELECT
     count(*)                                       AS tx_cnt,
     sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_cnt,
     sum(CASE WHEN is_revenue_eligible THEN 1 ELSE 0 END) AS revenue_eligible_cnt,
-    avg(amount)                                    AS avg_amount
+    avg(amount)                                    AS avg_amount,
+    current_timestamp()                            AS updated_at
 FROM enriched
 GROUP BY event_day, user_type

@@ -60,11 +60,11 @@ extraEnv: |
   - name: AIRFLOW_CONN_TRINO_DEFAULT
     value: "trino://airflow@trino.data-platform.svc.cluster.local:8080/hudi"
 
-# Доп. провайдеры предзашиты в кастомном образе lab08/airflow:2.10.4-cosmos
+# Доп. провайдеры предзашиты в кастомном образе lab08/airflow:2.10.4
 images:
   airflow:
     repository: lab08/airflow
-    tag: 2.10.4-cosmos
+    tag: 2.10.4
     pullPolicy: IfNotPresent
 
 createUserJob:

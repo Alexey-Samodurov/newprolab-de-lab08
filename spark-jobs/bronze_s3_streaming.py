@@ -23,6 +23,8 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, DoubleType, BooleanType,
 )
 
+from hudi_utils import hudi_opts, write_hudi
+
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -95,41 +97,8 @@ PROMO_CODES_SCHEMA = StructType([
 
 
 # ---------------------------------------------------------------------------
-# Hudi helpers
+# Hudi helpers (общая реализация в spark-jobs/hudi_utils.py)
 # ---------------------------------------------------------------------------
-
-def hudi_opts(table: str, db: str, pk: str, partition_field: str, precombine: str) -> dict:
-    return {
-        "hoodie.table.name": f"{db}_{table}",
-        "hoodie.datasource.write.table.type": "COPY_ON_WRITE",
-        "hoodie.datasource.write.recordkey.field": pk,
-        "hoodie.datasource.write.precombine.field": precombine,
-        "hoodie.datasource.write.partitionpath.field": partition_field or "",
-        "hoodie.datasource.write.hive_style_partitioning": "true",
-        "hoodie.datasource.write.operation": "upsert",
-        "hoodie.upsert.shuffle.parallelism": "4",
-        "hoodie.insert.shuffle.parallelism": "4",
-        "hoodie.datasource.hive_sync.enable": "true",
-        "hoodie.datasource.hive_sync.mode": "hms",
-        "hoodie.datasource.hive_sync.database": db,
-        "hoodie.datasource.hive_sync.table": table,
-        "hoodie.datasource.hive_sync.partition_fields": partition_field or "",
-        "hoodie.datasource.hive_sync.partition_extractor_class":
-            "org.apache.hudi.hive.MultiPartKeysValueExtractor"
-            if partition_field
-            else "org.apache.hudi.hive.NonPartitionedExtractor",
-        "hoodie.metadata.enable": "true",
-        "path": f"s3a://lake/{db}/{table}",
-    }
-
-
-def write_hudi(df: DataFrame, opts: dict) -> None:
-    if df.rdd.isEmpty():
-        return
-    w = df.write.format("hudi")
-    for k, v in opts.items():
-        w = w.option(k, v)
-    w.mode("append").save()
 
 
 # ---------------------------------------------------------------------------

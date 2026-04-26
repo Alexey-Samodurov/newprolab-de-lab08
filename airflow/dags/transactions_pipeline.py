@@ -44,18 +44,10 @@ def _bronze_has_rows() -> bool:
         return False
 
 
-DBT_INIT_SCRIPT = """\
-set -e
-mkdir -p /tmp/dbt-project && cd /tmp/dbt-project
-mkdir -p models/silver models/gold tests
-cp /tmp/cm/dbt_project.yml .
-cp /tmp/cm/profiles.yml .
-cp /tmp/cm/sources.yml models/sources.yml
-for f in /tmp/cm/silver_*.sql; do bn=$(basename "$f" | sed 's/^silver_//'); cp "$f" "models/silver/$bn"; done
-cp /tmp/cm/silver__silver.yml models/silver/_silver.yml
-for f in /tmp/cm/gold_*.sql; do bn=$(basename "$f" | sed 's/^gold_//'); cp "$f" "models/gold/$bn"; done
-cp /tmp/cm/gold__gold.yml models/gold/_gold.yml
-for f in /tmp/cm/test_*.sql; do bn=$(basename "$f" | sed 's/^test_//'); cp "$f" "tests/$bn"; done
+DBT_INIT_SCRIPT_PATH = "/tmp/cm/dbt-init.sh"
+"""Путь к общему init-скрипту внутри pod (см. dbt/dbt-init.sh).
+
+Раскладывает flat-configmap dbt-project в dbt-структуру.
 """
 
 dbt_volumes = [
@@ -78,7 +70,7 @@ def make_dbt_task(task_id: str, dbt_args: str) -> KubernetesPodOperator:
         image_pull_policy="IfNotPresent",
         service_account_name="spark",
         cmds=["sh", "-c"],
-        arguments=[DBT_INIT_SCRIPT + f"\ncd /tmp/dbt-project && dbt {dbt_args} --no-version-check"],
+        arguments=[f"sh {DBT_INIT_SCRIPT_PATH} && cd /tmp/dbt-project && dbt {dbt_args} --no-version-check"],
         volumes=dbt_volumes,
         volume_mounts=dbt_volume_mounts,
         env_vars=dbt_env,

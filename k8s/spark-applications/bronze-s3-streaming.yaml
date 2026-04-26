@@ -25,6 +25,11 @@ spec:
   arguments:
     - "s3a://lake/raw"
     - "s3a://hudi/.checkpoints/bronze-s3-stream"
+  # hudi_utils.py — общий хелпер; явно объявляем чтобы Spark разложил его в sys.path
+  # и driver/executor увидели импорт `from hudi_utils import ...`.
+  deps:
+    pyFiles:
+      - "local:///opt/spark/jobs/hudi_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: Always
@@ -41,18 +46,15 @@ spec:
     "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.hudi.catalog.HoodieCatalog"
     "spark.hadoop.hive.metastore.uris": "thrift://hive-metastore.data-platform.svc.cluster.local:9083"
     "spark.hadoop.fs.s3a.endpoint": "http://minio.storage.svc.cluster.local"
-    "spark.hadoop.fs.s3a.access.key": "minioadmin"
-    "spark.hadoop.fs.s3a.secret.key": "minioadmin123"
     "spark.hadoop.fs.s3a.path.style.access": "true"
     "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
     "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem"
-    "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+    # Берём creds из env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY),
+    # которые подставляются driver/executor через envSecretKeyRefs ниже.
+    # Никаких хардкоженных ключей в манифесте.
+    "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
-    # Для lab нам достаточно generic MinIO config выше — `lake` тот же кластер.
-    # Для production-YC раскомментируй per-bucket override на storage.yandexcloud.net
-    # и поменяй mainApplicationFile arg на "s3a://npl-lab08".
-    # 4 стрима в одной JVM → подними кол-во ядер драйвера, чтобы они шли реально параллельно.
     "spark.sql.streaming.numRecentProgressUpdates": "20"
   driver:
     cores: 1
@@ -61,6 +63,13 @@ spec:
     serviceAccount: spark
     labels:
       app: bronze-s3-streaming
+    envSecretKeyRefs:
+      AWS_ACCESS_KEY_ID:
+        name: lab08-credentials
+        key: AWS_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY:
+        name: lab08-credentials
+        key: AWS_SECRET_ACCESS_KEY
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
@@ -70,6 +79,13 @@ spec:
     memory: "1g"
     labels:
       app: bronze-s3-streaming
+    envSecretKeyRefs:
+      AWS_ACCESS_KEY_ID:
+        name: lab08-credentials
+        key: AWS_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY:
+        name: lab08-credentials
+        key: AWS_SECRET_ACCESS_KEY
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs

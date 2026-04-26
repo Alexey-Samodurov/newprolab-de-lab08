@@ -27,8 +27,8 @@ WITH ranked AS (
         ) AS rn
     FROM {{ source('bronze', 'exchange_rates') }}
     {% if is_incremental() %}
-      -- lookback 7 дней чтобы подхватить поздние обновления курса
-      WHERE timestamp >= unix_timestamp(date_sub(current_date(), 7))
+      -- lookback покрывает поздние корректировки курсов (см. ADR #25)
+      WHERE timestamp >= unix_timestamp(date_sub(current_date(), {{ var('rates_lookback_days', 30) }}))
     {% endif %}
 )
 SELECT
@@ -36,7 +36,6 @@ SELECT
     update_id,
     timestamp,
     rate_tgrk_punk,
-    rate_tgrk_rub,
-    1.0                  AS rate_tgrk_tgrk
+    rate_tgrk_rub
 FROM ranked
 WHERE rn = 1

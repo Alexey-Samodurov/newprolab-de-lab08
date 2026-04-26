@@ -10,8 +10,11 @@ Bronze ingest из Kafka (Structured Streaming).
 Чекпойнты — общий путь, поскольку один query / один writer.
 """
 import sys
+import os
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
+
+from hudi_utils import hudi_opts, write_hudi
 
 
 EVENT_SCHEMA = StructType([
@@ -37,41 +40,6 @@ EVENT_SCHEMA = StructType([
 ])
 
 
-def hudi_opts(table, db, pk, partition_field, precombine):
-    opts = {
-        "hoodie.table.name": f"{db}_{table}_kafka",
-        "hoodie.datasource.write.table.type": "COPY_ON_WRITE",
-        "hoodie.datasource.write.recordkey.field": pk,
-        "hoodie.datasource.write.precombine.field": precombine,
-        "hoodie.datasource.write.partitionpath.field": partition_field or "",
-        "hoodie.datasource.write.hive_style_partitioning": "true",
-        "hoodie.datasource.write.operation": "upsert",
-        "hoodie.upsert.shuffle.parallelism": "4",
-        "hoodie.insert.shuffle.parallelism": "4",
-        "hoodie.datasource.hive_sync.enable": "true",
-        "hoodie.datasource.hive_sync.mode": "hms",
-        "hoodie.datasource.hive_sync.database": db,
-        "hoodie.datasource.hive_sync.table": f"{table}_kafka",
-        "hoodie.datasource.hive_sync.partition_fields": partition_field or "",
-        "hoodie.datasource.hive_sync.partition_extractor_class":
-            "org.apache.hudi.hive.MultiPartKeysValueExtractor"
-            if partition_field
-            else "org.apache.hudi.hive.NonPartitionedExtractor",
-        "hoodie.metadata.enable": "true",
-        "path": f"s3a://lake/{db}/{table}_kafka",
-    }
-    return opts
-
-
-def write_hudi(df, opts):
-    if df.rdd.isEmpty():
-        return
-    w = df.write.format("hudi")
-    for k, v in opts.items():
-        w = w.option(k, v)
-    w.mode("append").save()
-
-
 def process_batch(batch_df, batch_id):
     if batch_df.rdd.isEmpty():
         return
@@ -87,7 +55,7 @@ def process_batch(batch_df, batch_id):
           .withColumn("ingested_at", F.current_timestamp()))
     write_hudi(tx, hudi_opts("transactions", "bronze",
                              pk="composite_pk", partition_field="event_day",
-                             precombine="ingested_at"))
+                             precombine="ingested_at", table_suffix="_kafka"))
 
     cancel = (batch_df.filter(F.col("_source") == "cancellation")
               .withColumn("cancelled_ts", F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm"))
@@ -95,22 +63,33 @@ def process_batch(batch_df, batch_id):
               .withColumn("ingested_at", F.current_timestamp()))
     write_hudi(cancel, hudi_opts("cancellations", "bronze",
                                  pk="cancellation_id", partition_field="event_day",
-                                 precombine="ingested_at"))
+                                 precombine="ingested_at", table_suffix="_kafka"))
 
     rates = (batch_df.filter(F.col("_source") == "exchange_rate")
              .withColumn("ingested_at", F.current_timestamp()))
     write_hudi(rates, hudi_opts("exchange_rates", "bronze",
                                 pk="update_id", partition_field="",
-                                precombine="timestamp"))
+                                precombine="timestamp", table_suffix="_kafka"))
 
     print(f"[batch {batch_id}] tx={tx.count()} cancel={cancel.count()} rates={rates.count()}")
     batch_df.unpersist()
 
 
 def main():
-    bootstrap = sys.argv[1] if len(sys.argv) > 1 else "kafka.npl.svc.cluster.local:9092"
-    topic = sys.argv[2] if len(sys.argv) > 2 else "lab08_transactions"
+    # Bootstrap servers и topic ОБЯЗАТЕЛЬНО передаются как аргументы или env
+    # (без хардкоженных дефолтов — тот же скрипт переключаемый между средами).
+    # SparkApplication в k8s/spark-applications/bronze-kafka-ingest.yaml пробрасывает
+    # KAFKA_BOOTSTRAP_SERVERS из Secret lab08-credentials.
+    bootstrap = (sys.argv[1] if len(sys.argv) > 1
+                 else os.environ.get("KAFKA_BOOTSTRAP_SERVERS"))
+    topic = (sys.argv[2] if len(sys.argv) > 2
+             else os.environ.get("KAFKA_TOPIC", "lab08_transactions"))
     starting = sys.argv[3] if len(sys.argv) > 3 else "earliest"
+
+    if not bootstrap:
+        raise RuntimeError(
+            "KAFKA_BOOTSTRAP_SERVERS не задан (ни через argv, ни через env). "
+            "Проверь Secret lab08-credentials и envSecretKeyRefs в SparkApplication.")
 
     spark = (SparkSession.builder
              .appName("bronze-kafka-ingest")

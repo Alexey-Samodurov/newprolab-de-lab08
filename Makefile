@@ -1,7 +1,7 @@
-.PHONY: help check up down ns secrets diff status spark-image hms clean \
+.PHONY: help check up down ns secrets diff status spark-image hms \
         spark-code dbt-configmap airflow-dags airflow-trigger-pipeline superset-init \
         ingress hosts images airflow-image hms-image rbac thrift airflow-unpause wait-airflow ensure-buckets verify-trino \
-        bootstrap-pipeline seed-data streaming-apps
+        bootstrap-pipeline seed-data streaming-apps kafka-streaming-app
 
 KIND_CONTEXT ?= docker-desktop
 SAMPLE_DIR ?= lab08/sample
@@ -18,7 +18,7 @@ help:
 	@echo "  make hms-image                - собрать кастомный Hive Metastore image"
 	@echo "  make images                   - собрать все кастомные image (skip если уже есть)"
 	@echo "  make hms                      - применить hive-metastore deployment"
-	@echo "  make rbac                     - применить spark-rbac, spark-secrets, airflow-rbac"
+	@echo "  make rbac                     - применить spark-rbac, airflow-rbac"
 	@echo "  make thrift                   - применить thrift-server.yaml"
 	@echo "  make streaming-apps           - применить long-running streaming SparkApplications (S3 + Kafka)"
 	@echo "  make ensure-buckets           - убедиться что lake bucket существует (для существующего MinIO)"
@@ -33,8 +33,7 @@ help:
 	@echo "  make superset-init            - создать datasources, charts и dashboard в Superset"
 	@echo "  make diff                     - helmfile diff (что изменится)"
 	@echo "  make status                   - kubectl get pods во всех namespaces проекта"
-	@echo "  make down                     - helmfile destroy + удалить HMS"
-	@echo "  make clean                    - удалить namespaces (NB: PVC данные пропадут)"
+	@echo "  make down                     - helmfile destroy + удалить HMS (PVC данные пропадут)"
 
 check:
 	@kubectl config current-context | grep -q "$(KIND_CONTEXT)" || (echo "Wrong context: expected $(KIND_CONTEXT)" && exit 1)
@@ -58,8 +57,8 @@ spark-image:
 
 # Собирает airflow image только если его нет (идемпотентно).
 airflow-image:
-	@docker image inspect lab08/airflow:2.10.4-cosmos >/dev/null 2>&1 \
-	  || docker build -t lab08/airflow:2.10.4-cosmos docker/airflow/
+	@docker image inspect lab08/airflow:2.10.4 >/dev/null 2>&1 \
+	  || docker build -t lab08/airflow:2.10.4 docker/airflow/
 
 # Собирает hive-metastore image только если его нет (идемпотентно).
 hms-image:
@@ -112,10 +111,10 @@ hms:
 	kubectl apply -f k8s/hive-metastore.yaml >/dev/null
 	kubectl -n data-platform rollout status deployment/hive-metastore --timeout=300s
 
-# RBAC + secrets для spark-jobs namespace и cross-ns доступа Airflow.
+# RBAC для spark-jobs namespace и cross-ns доступа Airflow.
+# Сами Secrets применяются отдельным таргетом `make secrets` (см. k8s/secrets.example.yaml).
 rbac:
 	kubectl apply -f k8s/spark-rbac.yaml >/dev/null
-	kubectl apply -f k8s/spark-secrets.yaml >/dev/null
 	kubectl apply -f k8s/airflow-rbac.yaml >/dev/null
 
 # Spark Thrift Server (Deployment + 2 Service + configmap). Идемпотентно через kubectl apply.
@@ -123,15 +122,25 @@ thrift:
 	kubectl apply -f k8s/spark-applications/thrift-server.yaml >/dev/null
 	kubectl -n spark-jobs rollout status deployment/spark-thrift-server --timeout=300s
 
-# Long-running streaming SparkApplications: bronze.* ingest из S3 (file source)
-# и из Kafka. SparkApp'ы декларативные (restartPolicy: Always + checkpoints на S3),
-# Airflow ими не управляет — они живут отдельно от orchestration слоя.
+# Long-running streaming SparkApplications: bronze.* ingest из S3 (file source).
+# SparkApp декларативный (restartPolicy: Always + checkpoints на S3),
+# Airflow им не управляет — он живёт отдельно от orchestration слоя.
 # Идемпотентно: kubectl apply, повторный запуск не пересоздаёт running app.
+#
+# NB: Kafka SparkApp применяется ОТДЕЛЬНО через `make kafka-streaming-app`,
+# т.к. внешний брокер (kafka.ijklmn.xyz:9092) недоступен в большинстве сред —
+# при включении он бы бесконечно рестартовал (см. ADR #24 в lab08/PLAN.md).
 streaming-apps:
-	@echo ">>> Применяю streaming SparkApplications (S3 + Kafka)..."
+	@echo ">>> Применяю streaming SparkApplication (S3)..."
 	kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
+	@echo "    SparkApp applied. bronze.* появится через ~1-3 мин (cold start)."
+
+# Kafka streaming SparkApp — применять только когда брокер реально доступен,
+# иначе бесконечный CrashLoopBackOff. См. ADR #24.
+kafka-streaming-app:
+	@echo ">>> Применяю bronze-kafka-ingest SparkApplication..."
+	@echo "    ВНИМАНИЕ: убедись, что Kafka-брокер из Secret lab08-credentials (KAFKA_BOOTSTRAP_SERVERS) доступен изнутри кластера."
 	kubectl apply -f k8s/spark-applications/bronze-kafka-ingest.yaml >/dev/null
-	@echo "    SparkApps applied. bronze.* появится через ~1-3 мин (cold start)."
 
 # На случай если MinIO Tenant уже создан без `lake` bucket — досоздаём через mc внутри pod'а.
 # Идемпотентно: mc mb игнорирует уже существующие buckets с --ignore-existing.
@@ -207,7 +216,6 @@ down:
 	-kubectl delete -f k8s/ingress.yaml --ignore-not-found
 	-kubectl delete -f k8s/airflow-rbac.yaml --ignore-not-found
 	-kubectl delete -f k8s/spark-rbac.yaml --ignore-not-found
-	-kubectl delete -f k8s/spark-secrets.yaml --ignore-not-found
 	-test -f k8s/secrets.yaml && kubectl delete -f k8s/secrets.yaml --ignore-not-found || true
 	-kubectl -n spark-jobs delete configmap spark-jobs-code dbt-project --ignore-not-found
 	@echo ">>> 3/6 helmfile destroy (все helm-релизы)..."
@@ -226,9 +234,6 @@ down:
 	@echo "  Для полной переустановки: make up"
 	@echo "================================================================"
 
-# clean — алиас на down (раньше был ещё один шаг, но теперь down делает всё).
-clean: down
-
 # Пересоздаёт ConfigMap spark-jobs-code из spark-jobs/*.py.
 # spark-jobs/ — единственный источник правды для PySpark скриптов.
 spark-code:
@@ -237,11 +242,14 @@ spark-code:
 	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # Пересоздаёт ConfigMap dbt-project из dbt/ (flat layout, имена префиксированы слоем).
-# Airflow KubernetesPodOperator и k8s/dbt-job.yaml читают этот configmap.
+# Airflow KubernetesPodOperator читает этот configmap; dbt-init.sh раскладывает
+# flat-структуру в нормальную dbt-проектную раскладку.
 dbt-configmap:
 	kubectl create configmap dbt-project -n spark-jobs \
 	  --from-file=dbt_project.yml=dbt/dbt_project.yml \
 	  --from-file=profiles.yml=dbt/profiles.yml \
+	  --from-file=dbt-init.sh=dbt/dbt-init.sh \
+	  --from-file=macros_generate_schema_name.sql=dbt/macros/generate_schema_name.sql \
 	  --from-file=sources.yml=dbt/models/sources.yml \
 	  --from-file=silver_transactions_clean.sql=dbt/models/silver/transactions_clean.sql \
 	  --from-file=silver_cancellations_clean.sql=dbt/models/silver/cancellations_clean.sql \
@@ -351,7 +359,7 @@ bootstrap-pipeline:
 	  case "$$out" in [1-9]*) return 0 ;; *) return 1 ;; esac; \
 	}; \
 	echo ">>> bootstrap: проверяю gold-таблицы..."; \
-	if count_positive hudi.silver_gold.transactions_by_hour; then \
+	if count_positive hudi.gold.transactions_by_hour; then \
 	  echo "    gold уже наполнен — skip"; exit 0; \
 	fi; \
 	echo "    gold пустой — триггерю transactions_pipeline (sensor сам подождёт bronze)..."; \
@@ -360,7 +368,7 @@ bootstrap-pipeline:
 	echo ">>> жду gold (до 25 мин: cold start Spark + первый micro-batch + sensor + dbt silver/gold/test)..."; \
 	for i in $$(seq 1 150); do \
 	  sleep 10; \
-	  if count_positive hudi.silver_gold.transactions_by_hour; then \
+	  if count_positive hudi.gold.transactions_by_hour; then \
 	    echo "    gold готов (попытка $$i/150)"; exit 0; \
 	  fi; \
 	  if [ $$((i % 6)) = 0 ]; then echo "    жду gold... ($$i/150, ~$$((i / 6)) мин)"; fi; \

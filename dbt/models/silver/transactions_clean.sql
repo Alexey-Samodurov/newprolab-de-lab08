@@ -38,7 +38,7 @@ WITH src AS (
         ) AS rn
     FROM {{ source('bronze', 'transactions') }}
     {% if is_incremental() %}
-      WHERE event_day >= date_sub(current_date(), 7)
+      WHERE event_day >= date_sub(current_date(), {{ var('transactions_lookback_days', 30) }})
     {% endif %}
 ),
 dedup AS (

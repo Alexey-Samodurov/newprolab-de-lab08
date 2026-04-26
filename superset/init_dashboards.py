@@ -8,7 +8,7 @@ Superset bootstrap: создаёт database connection, datasets, charts и да
 
 Что создаётся:
   1. Database connection → Trino (lab08-trino)
-  2. Datasets (silver_gold.*) с проставленным main_dttm_col для time-series
+  2. Datasets (gold.*) с проставленным main_dttm_col для time-series
   3. Charts:
      KPI-полоса (Big Number):
        - KPI: Total Revenue (TGRK)
@@ -124,7 +124,7 @@ class SupersetClient:
 # Database / datasets
 # ---------------------------------------------------------------------------
 
-GOLD_SCHEMA = "silver_gold"
+GOLD_SCHEMA = "gold"
 
 # Какая колонка у каждого датасета является основной временной (для time-series viz).
 DATASET_MAIN_DTTM = {

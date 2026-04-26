@@ -20,9 +20,9 @@ data:
     spark.driver.host                             spark-thrift-driver-headless.spark-jobs.svc.cluster.local
     spark.driver.port                             7078
     spark.blockManager.port                       7079
-    spark.driver.memory                           1500m
+    spark.driver.memory                           1000m
     spark.executor.cores                          1
-    spark.executor.memory                         1500m
+    spark.executor.memory                         1000m
 
     spark.dynamicAllocation.enabled               true
     spark.dynamicAllocation.shuffleTracking.enabled  true
@@ -39,12 +39,17 @@ data:
 
     spark.hadoop.hive.metastore.uris              thrift://hive-metastore.data-platform.svc.cluster.local:9083
     spark.hadoop.fs.s3a.endpoint                  http://minio.storage.svc.cluster.local
-    spark.hadoop.fs.s3a.access.key                minioadmin
-    spark.hadoop.fs.s3a.secret.key                minioadmin123
     spark.hadoop.fs.s3a.path.style.access         true
     spark.hadoop.fs.s3a.connection.ssl.enabled    false
     spark.hadoop.fs.s3a.impl                      org.apache.hadoop.fs.s3a.S3AFileSystem
-    spark.hadoop.fs.s3a.aws.credentials.provider  org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+    # creds читаются из env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+    # Driver получает env из envFrom: lab08-credentials (см. Deployment ниже),
+    # executors поднимаются Spark'ом отдельными pod'ами и НЕ наследуют env driver'а —
+    # пробрасываем явно через secretKeyRef в executor pod template.
+    spark.hadoop.fs.s3a.aws.credentials.provider                                com.amazonaws.auth.EnvironmentVariableCredentialsProvider
+    spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID                    lab08-credentials:AWS_ACCESS_KEY_ID
+    spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY                lab08-credentials:AWS_SECRET_ACCESS_KEY
+    spark.kubernetes.executor.secretKeyRef.AWS_ENDPOINT_URL                     lab08-credentials:AWS_ENDPOINT_URL
 
     spark.sql.hive.thriftServer.singleSession     false
     spark.hadoop.hive.server2.thrift.port         10000
@@ -123,6 +128,11 @@ spec:
               value: "true"
             - name: SPARK_HOME
               value: "/opt/spark"
+          envFrom:
+            # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY читаются hadoop-aws через
+            # EnvironmentVariableCredentialsProvider (см. spark-defaults выше).
+            - secretRef:
+                name: lab08-credentials
           ports:
             - name: thrift-jdbc
               containerPort: 10000

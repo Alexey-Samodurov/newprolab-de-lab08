@@ -1,5 +1,7 @@
 ---
 # Bronze Kafka streaming — long-running.
+# NB: применять только когда Kafka реально доступна (см. ADR #24);
+# из `make up` этот SparkApp намеренно НЕ применяется — иначе CrashLoop.
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
@@ -12,10 +14,13 @@ spec:
   image: lab08/spark:3.5.8-hudi-1.1.1
   imagePullPolicy: IfNotPresent
   mainApplicationFile: "local:///opt/spark/jobs/bronze_kafka_ingest.py"
-  arguments:
-    - "kafka.ijklmn.xyz:9092"
-    - "lab08_transactions"
-    - "earliest"
+  # Скрипт читает bootstrap/topic из env ($KAFKA_BOOTSTRAP_SERVERS, $KAFKA_TOPIC)
+  # которые подставляются ниже из Secret lab08-credentials.
+  arguments: []
+  # hudi_utils.py — общий хелпер; явно объявляем чтобы Spark разложил его в sys.path.
+  deps:
+    pyFiles:
+      - "local:///opt/spark/jobs/hudi_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: Always
@@ -32,14 +37,13 @@ spec:
     "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.hudi.catalog.HoodieCatalog"
     "spark.hadoop.hive.metastore.uris": "thrift://hive-metastore.data-platform.svc.cluster.local:9083"
     "spark.hadoop.fs.s3a.endpoint": "http://minio.storage.svc.cluster.local"
-    "spark.hadoop.fs.s3a.access.key": "minioadmin"
-    "spark.hadoop.fs.s3a.secret.key": "minioadmin123"
     "spark.hadoop.fs.s3a.path.style.access": "true"
     "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
     "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem"
-    "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+    # AWS_* env vars подставляются в pod из Secret (см. envSecretKeyRefs ниже),
+    # никаких хардкоженных ключей в манифесте.
+    "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
-    # Очистка executor-подов сразу после завершения/перезапуска
     "spark.kubernetes.executor.deleteOnTermination": "true"
     "spark.sql.streaming.checkpointLocation": "s3a://hudi/.checkpoints/bronze-kafka"
   driver:
@@ -49,6 +53,19 @@ spec:
     serviceAccount: spark
     labels:
       app: bronze-kafka-ingest
+    envSecretKeyRefs:
+      AWS_ACCESS_KEY_ID:
+        name: lab08-credentials
+        key: AWS_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY:
+        name: lab08-credentials
+        key: AWS_SECRET_ACCESS_KEY
+      KAFKA_BOOTSTRAP_SERVERS:
+        name: lab08-credentials
+        key: KAFKA_BOOTSTRAP_SERVERS
+      KAFKA_TOPIC:
+        name: lab08-credentials
+        key: KAFKA_TOPIC
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
@@ -58,6 +75,13 @@ spec:
     memory: "1g"
     labels:
       app: bronze-kafka-ingest
+    envSecretKeyRefs:
+      AWS_ACCESS_KEY_ID:
+        name: lab08-credentials
+        key: AWS_ACCESS_KEY_ID
+      AWS_SECRET_ACCESS_KEY:
+        name: lab08-credentials
+        key: AWS_SECRET_ACCESS_KEY
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs

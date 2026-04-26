@@ -20,14 +20,20 @@ models:
       +schema: silver
       +location_root: s3a://lake/silver
     gold:
-      +materialized: table
+      # ВАЖНО: НЕ ставить materialized=table — dbt-spark делает DROP TABLE,
+      # но S3-директория остаётся → следующий CREATE склеивает старые parquet
+      # со свежими и накапливает дубли (см. ADR #16 в lab08/PLAN.md).
+      +materialized: incremental
       +file_format: hudi
+      +incremental_strategy: merge
       +schema: gold
       +location_root: s3a://lake/gold
 
 vars:
   base_currency: "TGRK"
-  # Lookback для инкрементальных моделей отмен.
-  # 30 дней покрывает весь период данных + late-arriving cancellations
-  # (README: отмена может прийти на следующий день).
+  # Lookback для инкрементальных моделей. 30 дней покрывает весь период
+  # данных + late-arriving cancellations и обновления курсов
+  # (README: отмена/курс могут прийти на следующий день).
   cancellations_lookback_days: 30
+  transactions_lookback_days: 30
+  rates_lookback_days: 30

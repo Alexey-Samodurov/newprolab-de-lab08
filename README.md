@@ -66,7 +66,7 @@ make check
 make images
 # Builds:
 #   lab08/spark:3.5.8-hudi-1.1.1   (Spark + Hudi + dbt-spark)
-#   lab08/airflow:2.10.4-cosmos     (Airflow + providers)
+#   lab08/airflow:2.10.4     (Airflow + providers)
 ```
 
 ### 2. Поднять инфраструктуру
@@ -267,7 +267,6 @@ lab08/
 │   ├── hive-metastore.yaml
 │   ├── spark-rbac.yaml
 │   ├── airflow-rbac.yaml
-│   ├── dbt-job.yaml             # разовый ручной dbt прогон
 │   └── spark-applications/
 │       ├── bronze-s3-streaming.yaml
 │       ├── bronze-kafka-ingest.yaml
@@ -305,11 +304,6 @@ make spark-code
 # Пересобрать ConfigMap с dbt проектом (после изменений в dbt/)
 make dbt-configmap
 
-# Разовый dbt прогон (без Airflow)
-kubectl apply -f k8s/dbt-job.yaml
-kubectl -n spark-jobs logs -f job/dbt-run
-
 # Удалить всё
 make down
-make clean  # также удаляет namespaces и PVC
 ```

@@ -4,7 +4,7 @@
   vs лимиты, флаг просрочки.
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge', unique_key='promo_code_id',
-   options={'primaryKey': 'promo_code_id', 'preCombineField': 'promo_code_id', 'type': 'cow'}) }}
+   options={'primaryKey': 'promo_code_id', 'preCombineField': 'updated_at', 'type': 'cow'}) }}
 
 WITH usage AS (
     SELECT
@@ -37,6 +37,7 @@ SELECT
               AND u.last_used_at > to_timestamp(c.expiry_date)
          THEN true ELSE false END  AS used_after_expiry,
     CASE WHEN c.max_uses IS NOT NULL AND coalesce(u.uses_total, 0) > c.max_uses
-         THEN true ELSE false END  AS over_limit
+         THEN true ELSE false END  AS over_limit,
+    current_timestamp()             AS updated_at
 FROM codes c
 FULL OUTER JOIN usage u ON c.promo_code_id = u.promo_code_id

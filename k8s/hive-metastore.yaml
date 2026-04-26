@@ -44,12 +44,8 @@ data:
         <value>http://minio.storage.svc.cluster.local</value>
       </property>
       <property>
-        <name>fs.s3a.access.key</name>
-        <value>minioadmin</value>
-      </property>
-      <property>
-        <name>fs.s3a.secret.key</name>
-        <value>minioadmin123</value>
+        <name>fs.s3a.aws.credentials.provider</name>
+        <value>com.amazonaws.auth.EnvironmentVariableCredentialsProvider</value>
       </property>
       <property>
         <name>fs.s3a.path.style.access</name>
@@ -89,6 +85,12 @@ spec:
           ports:
             - name: thrift
               containerPort: 9083
+          envFrom:
+            # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY → читаются hadoop-aws через
+            # EnvironmentVariableCredentialsProvider (см. metastore-site.xml).
+            # Secret определяется в k8s/secrets.example.yaml → секции data-platform.
+            - secretRef:
+                name: minio-credentials
           volumeMounts:
             - name: conf
               mountPath: /opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml

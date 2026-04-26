@@ -8,7 +8,7 @@
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge',
    unique_key='pk',
-   options={'primaryKey': 'pk', 'preCombineField': 'pk', 'type': 'cow'}) }}
+   options={'primaryKey': 'pk', 'preCombineField': 'updated_at', 'type': 'cow'}) }}
 
 WITH cancellations AS (
     SELECT
@@ -64,6 +64,7 @@ SELECT
     avg(seconds_to_cancel)                                   AS avg_seconds_to_cancel,
     min(seconds_to_cancel)                                   AS min_seconds_to_cancel,
     max(seconds_to_cancel)                                   AS max_seconds_to_cancel,
-    sum(coalesce(refund_amount, 0))                          AS total_refund_amount
+    sum(coalesce(refund_amount, 0))                          AS total_refund_amount,
+    current_timestamp()                                      AS updated_at
 FROM joined
 GROUP BY cancel_day, coalesce(reason, 'unknown')
