@@ -46,6 +46,15 @@ spec:
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
     "spark.sql.streaming.checkpointLocation": "s3a://hudi/.checkpoints/bronze-kafka"
+    # Observability: см. bronze-s3-streaming.yaml — то же.
+    "spark.metrics.namespace": "spark"
+    "spark.sql.streaming.metricsEnabled": "true"
+    "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet"
+    "spark.metrics.conf.*.sink.prometheusServlet.path": "/metrics/prometheus/"
+    "spark.metrics.conf.master.sink.prometheusServlet.path": "/metrics/master/prometheus/"
+    "spark.metrics.conf.applications.sink.prometheusServlet.path": "/metrics/applications/prometheus/"
+    "spark.metrics.conf.driver.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
+    "spark.metrics.conf.executor.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
   driver:
     cores: 1
     coreLimit: "2000m"
@@ -53,6 +62,7 @@ spec:
     serviceAccount: spark
     labels:
       app: bronze-kafka-ingest
+    # Hudi metrics OFF — см. spark-jobs/hudi_utils.py / bronze-s3-streaming.yaml.
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials

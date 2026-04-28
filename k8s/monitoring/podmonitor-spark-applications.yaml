@@ -1,0 +1,42 @@
+---
+# Универсальный PodMonitor для всех SparkApplication-ов, поднятых Spark Operator-ом.
+# Подхватывает любые приложения автоматически — не нужно править манифест при
+# добавлении новой SparkApp. Селектор по двум lab-нейтральным лейблам:
+#   * sparkoperator.k8s.io/launched-by-spark-operator=true — ставит сам оператор
+#   * spark-role=driver                                    — ставит сам Spark
+#
+# Executor-pod-ы НЕ скрейпятся: их метрики Spark уже публикует через driver
+# в /metrics/prometheus/ (PrometheusServlet aggregates executor sources).
+#
+# Лейбл `sparkoperator.k8s.io/app-name` относейблится в `spark_app_name` —
+# единый ключ для дашборда (фильтр $spark_app покрывает и Thrift, и SparkApps).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: spark-applications
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: lab08-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - spark-jobs
+  selector:
+    matchLabels:
+      sparkoperator.k8s.io/launched-by-spark-operator: "true"
+      spark-role: driver
+  podMetricsEndpoints:
+    - port: spark-ui      # порт 4040 — определён Spark Operator-ом по умолчанию для driver-pod
+      path: /metrics/prometheus/
+      interval: 30s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_sparkoperator_k8s_io_app_name]
+          targetLabel: spark_app_name
+        - sourceLabels: [__meta_kubernetes_pod_label_spark_role]
+          targetLabel: spark_role
+    # NB: Hudi native PROMETHEUS reporter (port 9091) намеренно НЕ скрейпим —
+    # в Hudi 1.1.1 он несовместим со стандартным simpleclient_dropwizard
+    # из Maven Central (NoSuchMethodError на shaded MetricRegistry). Hudi-метрики
+    # выключены в spark-jobs/hudi_utils.py; наблюдаемость держим на Spark
+    # DAGScheduler-метриках, экспортируемых тем же 4040/PrometheusServlet.
+    # См. lab08/OBSERVABILITY_PLAN.md → Known issues.

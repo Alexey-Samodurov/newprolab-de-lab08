@@ -1,0 +1,124 @@
+# prometheus-statsd-exporter — приёмник statsd-метрик от Airflow,
+# конвертирует их в Prometheus формат с распарсенными labels.
+# https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-statsd-exporter
+#
+# Airflow шлёт UDP-метрики с именами вида:
+#   airflow.dag.<dag_id>.<task_id>.duration
+#   airflow.dagrun.duration.success.<dag_id>.<duration>
+#   airflow.ti_failures.<dag_id>.<task_id>
+# Без mapping мы получили бы один высоко-кардинальный метрик-name на каждый DAG/task —
+# непригодно для PromQL. Mapping ниже извлекает dag/task в полноценные labels.
+
+fullnameOverride: prometheus-statsd-exporter
+
+service:
+  type: ClusterIP
+  port: 9102          # /metrics
+  statsdPort: 9125    # UDP listener для Airflow
+
+# ServiceMonitor для kube-prometheus-stack (kps подхватит благодаря nil-selector).
+serviceMonitor:
+  enabled: true
+  interval: 30s
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Mapping rules. Шаблон: glob-match по statsd-имени → prometheus name + labels.
+# Базируется на best-practice конфиге Airflow community
+# (https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/metrics.html).
+# Покрываем: scheduler heartbeat, dagrun duration, task duration, ti_failures, executor counters, pool slots.
+statsd:
+  mappingConfig: |
+    mappings:
+      # ── Scheduler ──────────────────────────────────────────────────────────
+      - match: "airflow.scheduler_heartbeat"
+        name: "airflow_scheduler_heartbeat"
+        match_metric_type: counter
+      - match: "airflow.scheduler.tasks.killed_externally"
+        name: "airflow_scheduler_tasks_killed_externally"
+        match_metric_type: counter
+      - match: "airflow.scheduler.tasks.starving"
+        name: "airflow_scheduler_tasks_starving"
+
+      # ── DAG run ────────────────────────────────────────────────────────────
+      - match: "airflow.dagrun.duration.success.*"
+        name: "airflow_dagrun_duration_success"
+        labels:
+          dag: "$1"
+      - match: "airflow.dagrun.duration.failed.*"
+        name: "airflow_dagrun_duration_failed"
+        labels:
+          dag: "$1"
+      - match: "airflow.dagrun.dependency-check.*"
+        name: "airflow_dagrun_dependency_check"
+        labels:
+          dag: "$1"
+      - match: "airflow.dagrun.schedule_delay.*"
+        name: "airflow_dagrun_schedule_delay"
+        labels:
+          dag: "$1"
+
+      # ── Task instance ──────────────────────────────────────────────────────
+      - match: "airflow.dag.*.*.duration"
+        name: "airflow_task_duration"
+        labels:
+          dag: "$1"
+          task: "$2"
+      - match: "airflow.ti_failures"
+        name: "airflow_ti_failures"
+        match_metric_type: counter
+      - match: "airflow.ti_successes"
+        name: "airflow_ti_successes"
+        match_metric_type: counter
+      - match: "airflow.ti.start.*.*"
+        name: "airflow_ti_start"
+        labels:
+          dag: "$1"
+          task: "$2"
+        match_metric_type: counter
+      - match: "airflow.ti.finish.*.*.*"
+        name: "airflow_ti_finish"
+        labels:
+          dag: "$1"
+          task: "$2"
+          state: "$3"
+        match_metric_type: counter
+
+      # ── Executor ───────────────────────────────────────────────────────────
+      - match: "airflow.executor.open_slots"
+        name: "airflow_executor_open_slots"
+      - match: "airflow.executor.queued_tasks"
+        name: "airflow_executor_queued_tasks"
+      - match: "airflow.executor.running_tasks"
+        name: "airflow_executor_running_tasks"
+
+      # ── Pool ───────────────────────────────────────────────────────────────
+      - match: "airflow.pool.open_slots.*"
+        name: "airflow_pool_open_slots"
+        labels:
+          pool: "$1"
+      - match: "airflow.pool.used_slots.*"
+        name: "airflow_pool_used_slots"
+        labels:
+          pool: "$1"
+      - match: "airflow.pool.queued_slots.*"
+        name: "airflow_pool_queued_slots"
+        labels:
+          pool: "$1"
+      - match: "airflow.pool.starving_tasks.*"
+        name: "airflow_pool_starving_tasks"
+        labels:
+          pool: "$1"
+
+      # ── Catch-all (на будущее: метрики, не описанные явно, не теряются,
+      #    но получают плоское имя без labels — высокую кардинальность даст
+      #    только то, что включает dag_id в самом name) ──────────────────────
+      - match: "airflow.*"
+        name: "airflow_${1}"
+        match_metric_type: gauge

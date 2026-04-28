@@ -1,0 +1,1370 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Airflow task failures",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "changes(airflow_ti_failures[1m]) > 0",
+        "titleFormat": "Airflow task failure",
+        "tagKeys": "dag,task",
+        "step": "1m"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "lab08-overview",
+  "title": "Lab08 — Overview",
+  "tags": [
+    "lab08",
+    "spark",
+    "airflow",
+    "minio",
+    "hudi"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 4,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0
+      },
+      {
+        "name": "layer",
+        "label": "Layer",
+        "description": "Виртуальный фильтр по слою lakehouse. ⚠️ Все слои работают на Spark, но через разные процессы:\n• Bronze — отдельные SparkApplication-ы (bronze-s3-streaming, bronze-kafka-ingest), запускаемые spark-operator-ом\n• Silver / Gold — dbt-модели, исполняются через долгоживущий Spark Thrift Server (spark_app_name=spark-thrift-server)\nПоэтому при выборе Silver или Gold в Spark-панелях вы видите ОДИН и тот же Thrift driver — слои разделяются на уровне Airflow задач ($layer_task), а не на уровне Spark процесса.",
+        "type": "custom",
+        "query": "All : .*,Bronze : bronze-.*,Silver : spark-thrift-server,Gold : spark-thrift-server",
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": ".*"
+          },
+          {
+            "selected": false,
+            "text": "Bronze",
+            "value": "bronze-.*"
+          },
+          {
+            "selected": false,
+            "text": "Silver",
+            "value": "spark-thrift-server"
+          },
+          {
+            "selected": false,
+            "text": "Gold",
+            "value": "spark-thrift-server"
+          }
+        ],
+        "current": {
+          "text": "All",
+          "value": ".*"
+        },
+        "includeAll": false,
+        "multi": false,
+        "hide": 0
+      },
+      {
+        "name": "layer_task",
+        "label": "Layer task regex",
+        "description": "Airflow task regex, синхронный с $layer. Для каждого слоя — свой набор task из transactions_pipeline DAG.",
+        "type": "custom",
+        "query": "All : .*,Bronze : wait_bronze.*,Silver : dbt_silver,Gold : dbt_gold|dbt_test",
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": ".*"
+          },
+          {
+            "selected": false,
+            "text": "Bronze",
+            "value": "wait_bronze.*"
+          },
+          {
+            "selected": false,
+            "text": "Silver",
+            "value": "dbt_silver"
+          },
+          {
+            "selected": false,
+            "text": "Gold",
+            "value": "dbt_gold|dbt_test"
+          }
+        ],
+        "current": {
+          "text": "All",
+          "value": ".*"
+        },
+        "includeAll": false,
+        "multi": false,
+        "hide": 0
+      },
+      {
+        "name": "spark_app",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(up{spark_app_name=~\"$layer\", spark_app_name!=\"\"}, spark_app_name)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "Spark App",
+        "description": "Список Spark-драйверов, экспортирующих метрики через Prometheus servlet (port 4040). Сейчас здесь будут до 3 значений:\n• bronze-s3-streaming — Structured Streaming SparkApplication (bronze слой)\n• bronze-kafka-ingest — Structured Streaming SparkApplication (bronze слой)\n• spark-thrift-server — общий долгоживущий Spark driver, на котором dbt выполняет МОДЕЛИ silver и gold слоёв\nЕсли выбран Silver или Gold в $layer — здесь автоматически останется только spark-thrift-server."
+      },
+      {
+        "name": "dag",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(airflow_dagrun_duration_success, dag)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "DAG"
+      },
+      {
+        "name": "task",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(airflow_task_duration{dag=~\"$dag\", task=~\"$layer_task\"}, task)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "Task"
+      },
+      {
+        "name": "bucket",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(minio_bucket_usage_total_bytes, bucket)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "MinIO Bucket"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Pipeline health  —  $layer",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Spark drivers up",
+      "description": "count(up{spark_app_name=~\"$layer\", spark_app_name!=\"\"} == 1) — считаем только реальные Spark-драйверы (есть label spark_app_name). Без spark_app_name!=\"\" в подсчёт попадали бы все остальные up-цели кластера (apiserver, kubelet, minio, …) — у них spark_app_name отсутствует, а regex .* матчит и пустую строку. Зелёный = есть хотя бы один живой driver в выбранном слое, красный = ни одного.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "count(up{spark_app_name=~\"$layer\", spark_app_name!=\"\"} == 1)",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Airflow scheduler heartbeat / min",
+      "description": "rate(airflow_scheduler_heartbeat[5m]) * 60. Норма >=10. <5 = шедулер деградирует. Не зависит от $layer (общий компонент).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "rate(airflow_scheduler_heartbeat[5m]) * 60",
+          "refId": "A",
+          "legendFormat": "beats/min"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              },
+              {
+                "color": "green",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Failures total (5m)",
+      "description": "Сумма Airflow ti_failures + Spark Operator app failures за 5 минут. Один индикатор «есть ли инциденты». 0 = тишина, >=5 = инцидент. Аннотации failures видны на всех time series.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "(sum(increase(airflow_ti_finish{state=\"failed\", task=~\"$layer_task\"}[5m])) or vector(0)) + (sum(increase(spark_application_failure_count[5m])) or vector(0))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "MinIO drives online %",
+      "description": "sum(online)/sum(total)*100. 100 норма. <80 = тенант degraded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(minio_cluster_drive_online_total{job=\"minio\"}) / sum(minio_cluster_drive_total{job=\"minio\"}) * 100",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      }
+    },
+    {
+      "type": "row",
+      "id": 200,
+      "title": "Spark  ($layer · $spark_app)  —  RED",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Throughput — streaming input rows/s",
+      "description": "RATE. metrics_spark_driver_spark_streaming_<query>_inputRate_total_Value. Плоско в 0 при активном источнике = streaming остановился. Для silver/gold (Thrift) метрики не будет — это нормально.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (spark_app_name) (max by (spark_app_name, __name__) ({__name__=~\"metrics_spark_driver_spark_streaming_.+_inputRate_total_Value\", spark_app_name=~\"$spark_app\"}))",
+          "refId": "A",
+          "legendFormat": "{{spark_app_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 12,
+      "title": "Saturation — JVM heap % + GC time %",
+      "description": "Левая ось — driver heap (%, threshold lines 75/90). Правая ось — доля времени в GC (% wall clock, сумма по всем известным GC-пулам: Copy/MarkSweepCompact, PS, G1; недостающие пулы fallback в 0 чтобы суммирование не схлопывалось до пустого вектора). Heap >90 длительно или GC >5 = риск OOM/деградации throughput.\n\nNB: select `{__name__=~\".+_time_Value\"}` + rate() приводит к invalid vector (rate() strips __name__ → пулы Copy и MarkSweepCompact становятся идентичными labelset-ами и aggregator падает с \"vector cannot contain metrics with the same labelset\"). Поэтому каждый пул считаем отдельным rate() и суммируем явно.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "100 * max by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"}) / max by (spark_app_name) (metrics_spark_driver_jvm_heap_max_Value{spark_app_name=~\"$spark_app\"})",
+          "refId": "A",
+          "legendFormat": "heap % · {{spark_app_name}}"
+        },
+        {
+          "expr": "100 * (\n  (sum by (spark_app_name) (rate(metrics_spark_driver_jvm_Copy_time_Value{spark_app_name=~\"$spark_app\"}[1m]))                  or sum by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"} * 0))\n+ (sum by (spark_app_name) (rate(metrics_spark_driver_jvm_MarkSweepCompact_time_Value{spark_app_name=~\"$spark_app\"}[1m]))       or sum by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"} * 0))\n+ (sum by (spark_app_name) (rate(metrics_spark_driver_jvm_PS_Scavenge_time_Value{spark_app_name=~\"$spark_app\"}[1m]))            or sum by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"} * 0))\n+ (sum by (spark_app_name) (rate(metrics_spark_driver_jvm_PS_MarkSweep_time_Value{spark_app_name=~\"$spark_app\"}[1m]))           or sum by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"} * 0))\n+ (sum by (spark_app_name) (rate(metrics_spark_driver_jvm_G1_Young_Generation_time_Value{spark_app_name=~\"$spark_app\"}[1m]))    or sum by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"} * 0))\n+ (sum by (spark_app_name) (rate(metrics_spark_driver_jvm_G1_Old_Generation_time_Value{spark_app_name=~\"$spark_app\"}[1m]))      or sum by (spark_app_name) (metrics_spark_driver_jvm_heap_used_Value{spark_app_name=~\"$spark_app\"} * 0))\n) / 1000",
+          "refId": "B",
+          "legendFormat": "gc % · {{spark_app_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 75
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "gc %.*"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "GC time (% wall clock)"
+              },
+              {
+                "id": "max",
+                "value": 20
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "heap %.*"
+            },
+            "properties": [
+              {
+                "id": "custom.axisLabel",
+                "value": "JVM heap used (%)"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 250,
+      "title": "Spark deep dive (open if investigating)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "panels": [
+        {
+          "type": "timeseries",
+          "id": 251,
+          "title": "Latency — batch (ms) + Hudi commit p95 (s)",
+          "description": "DURATION. Левая ось: Spark micro-batch latency. Правая ось: Hudi commit/deltacommit p95. Скачок одной без другой подсказывает где затык.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "expr": "max by (spark_app_name) ({__name__=~\"metrics_spark_driver_spark_streaming_.+_latency_Value\", spark_app_name=~\"$spark_app\"})",
+              "refId": "A",
+              "legendFormat": "batch ms · {{spark_app_name}}"
+            },
+            {
+              "expr": "max by (spark_app_name, __name__) ({__name__=~\"hudi_.+_(commit|deltacommit|clustering)_timer\", quantile=\"0.95\", spark_app_name=~\"$spark_app\"}) / 1e9",
+              "refId": "B",
+              "legendFormat": "hudi p95 s · {{spark_app_name}} / {{__name__}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "hudi p95.*"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "s"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  },
+                  {
+                    "id": "custom.axisLabel",
+                    "value": "Hudi commit p95 (s)"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "batch ms.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.axisLabel",
+                    "value": "Batch latency (ms)"
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 15
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "mean",
+                "max"
+              ],
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 252,
+          "title": "Live executors (running pods)",
+          "description": "Количество Running executor-pod-ов в namespace spark-jobs, сгруппированных по spark_app_name. Лейбл извлекается из имени pod через label_replace (kube-state-metrics не экспортирует кастомные pod labels по умолчанию). Падение до 0 при активном streaming = драйвер потерял executors.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "legendFormat": "{{spark_app_name}}",
+              "expr": "count by (spark_app_name) (label_replace(kube_pod_status_phase{namespace=\"spark-jobs\", phase=\"Running\", pod=~\".+-[a-f0-9]{16}-exec-.+\"} == 1, \"spark_app_name\", \"$1\", \"pod\", \"(.+)-[a-f0-9]{16}-exec-.+\"))"
+            },
+            {
+              "refId": "B",
+              "legendFormat": "{{spark_app_name}}",
+              "expr": "count by (spark_app_name) (label_replace(kube_pod_status_phase{namespace=\"spark-jobs\", phase=\"Running\", pod=~\"spark-thrift-exec-.+\"} == 1, \"spark_app_name\", \"spark-thrift-server\", \"pod\", \".*\"))"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            }
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 15
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "min",
+                "max"
+              ],
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 253,
+          "title": "Spark write activity (jobs/min, failed stages)",
+          "description": "Spark DAGScheduler write activity: jobs/min (rate allJobs) + кумулятивные failed stages. Источник наблюдаемости write-пути для Hudi таблиц (нативный Hudi PROMETHEUS reporter выключен из-за несовместимости bundle 1.1.1 со стандартным simpleclient_dropwizard — см. lab08/OBSERVABILITY_PLAN.md → Known issues). DAGScheduler метрики публикуются Spark-нативно через PrometheusServlet на порту 4040. Растущий jobs/min = streaming активно коммитит micro-batches; failedStages > 0 — стейджи падают.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "legendFormat": "jobs/min · {{spark_app_name}}",
+              "expr": "60 * sum by (spark_app_name) (max by (spark_app_name) (rate(metrics_spark_driver_DAGScheduler_job_allJobs_Value{spark_app_name=~\"$spark_app\"}[1m])))"
+            },
+            {
+              "refId": "B",
+              "legendFormat": "failed stages · {{spark_app_name}}",
+              "expr": "sum by (spark_app_name) (max by (spark_app_name) (metrics_spark_driver_DAGScheduler_stage_failedStages_Value{spark_app_name=~\"$spark_app\"}))"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "failed stages.*"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "red"
+                    }
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  },
+                  {
+                    "id": "custom.axisLabel",
+                    "value": "failed stages (cum)"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "jobs/min.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.axisLabel",
+                    "value": "jobs / min"
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 22
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 300,
+      "title": "Airflow  ($layer · $dag / $task)  —  RED",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Throughput — tasks queued / running",
+      "description": "RATE/SATURATION. queued стабильно растёт при стабильном running = шедулер не успевает раздавать. queued ~0 при высоком running = здоровая утилизация.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(airflow_executor_queued_tasks)",
+          "refId": "A",
+          "legendFormat": "queued"
+        },
+        {
+          "expr": "sum(airflow_executor_running_tasks)",
+          "refId": "B",
+          "legendFormat": "running"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 17
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 21,
+      "title": "Duration — task duration (ms)",
+      "description": "DURATION. airflow_task_duration с лейблами dag/task. Фильтруется $dag/$task (которые в свою очередь подчинены $layer / $layer_task). Растущий тренд = деградация.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (dag, task) (airflow_task_duration{dag=~\"$dag\", task=~\"$task\"})",
+          "refId": "A",
+          "legendFormat": "{{dag}} / {{task}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 17
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 22,
+      "title": "Errors — task failures rate (5m)",
+      "description": "ERRORS. rate(airflow_ti_failures[5m]) с фильтром по $layer_task. >0 устойчиво = регулярные падения. Эти события также отрисованы аннотациями (красные вертикали) на остальных панелях для корреляции.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (dag, task) (rate(airflow_ti_finish{state=\"failed\", task=~\"$layer_task\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{dag}} / {{task}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "fixedColor": "red",
+            "mode": "fixed"
+          }
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "sum"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 350,
+      "title": "Airflow deep dive (open if investigating)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "panels": [
+        {
+          "type": "timeseries",
+          "id": 351,
+          "title": "DAG run duration (success)",
+          "description": "airflow_dagrun_duration_success — длительность успешных запусков.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "expr": "sum by (dag) (airflow_dagrun_duration_success{dag=~\"$dag\"})",
+              "refId": "A",
+              "legendFormat": "{{dag}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms"
+            }
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 26
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "mean",
+                "max"
+              ],
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 352,
+          "title": "Pool slots",
+          "description": "open / used / queued по пулу.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "expr": "sum by (pool) (airflow_pool_open_slots)",
+              "refId": "A",
+              "legendFormat": "open · {{pool}}"
+            },
+            {
+              "expr": "sum by (pool) (airflow_pool_used_slots)",
+              "refId": "B",
+              "legendFormat": "used · {{pool}}"
+            },
+            {
+              "expr": "sum by (pool) (airflow_pool_queued_slots)",
+              "refId": "C",
+              "legendFormat": "queued · {{pool}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            }
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 26
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 400,
+      "title": "MinIO  ($bucket)  —  RED",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 30,
+      "title": "S3 RED — req/s (left) + errors/s (right, red)",
+      "description": "RATE + ERRORS. Левая ось: rate(minio_s3_requests_total) by api. Правая ось: rate(minio_s3_requests_errors_total) красным. Когда errors появляются на фоне трафика — видно сразу.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (api) (rate(minio_s3_requests_total{job=\"minio\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "req · {{api}}"
+        },
+        {
+          "expr": "sum by (api) (rate(minio_s3_requests_errors_total{job=\"minio\"}[1m]))",
+          "refId": "B",
+          "legendFormat": "err · {{api}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "err ·.*"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "errors/s"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "req ·.*"
+            },
+            "properties": [
+              {
+                "id": "custom.axisLabel",
+                "value": "requests/s"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 28
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 31,
+      "title": "Duration — S3 TTFB p99 by api",
+      "description": "DURATION. p99 time-to-first-byte по типу S3-операции. Растущий p99 при стабильном req/s = деградация хранилища.\n\nNB: MinIO экспортирует non-standard histogram `minio_s3_requests_ttfb_seconds_distribution` (без суффикса `_bucket`), при этом в lowercase-вариантах api отсутствует bucket le=\"+Inf\" → стандартный histogram_quantile возвращает NaN. Синтезируем +Inf из значения le=\"10.000\" через label_replace (предполагаем что нет операций > 10s — для лабы валидно). Capitalized api-серии (только le=+Inf, summary-style) фильтруем `api=~\"[a-z].*\"`. Дедуп double-scrape (job=minio + job=lab08-hl от headless service) через `job=\"minio\"`.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (api, le) (\n    rate(minio_s3_requests_ttfb_seconds_distribution{job=\"minio\", api=~\"[a-z].*\"}[5m])\n  or\n    label_replace(\n      rate(minio_s3_requests_ttfb_seconds_distribution{job=\"minio\", api=~\"[a-z].*\", le=\"10.000\"}[5m]),\n      \"le\", \"+Inf\", \"le\", \".*\"\n    )\n))",
+          "refId": "A",
+          "legendFormat": "{{api}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 28
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "id": 450,
+      "title": "MinIO deep dive (open if investigating)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "panels": [
+        {
+          "type": "bargauge",
+          "id": 451,
+          "title": "Bucket usage",
+          "description": "minio_bucket_usage_total_bytes по $bucket. Растёт медленно (часы/дни) — поэтому в deep-dive, не в основной секции.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "expr": "max by (bucket) (minio_bucket_usage_total_bytes{bucket=~\"$bucket\"})",
+              "refId": "A",
+              "legendFormat": "{{bucket}}"
+            }
+          ],
+          "options": {
+            "orientation": "horizontal",
+            "displayMode": "gradient"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes"
+            }
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 0,
+            "y": 37
+          }
+        },
+        {
+          "type": "timeseries",
+          "id": 452,
+          "title": "Network rx / tx",
+          "description": "Сетевой трафик MinIO S3-API (cumulative counters minio_s3_traffic_received_bytes / sent_bytes; берём 5m окно чтобы покрыть периоды без активности — на 1m окне irate возвращает 0 если в последние 2 sample не было запросов). Дедуп double-scrape через job=minio. При росте TTFB и свободных CPU/диске — смотри сюда.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(minio_s3_traffic_received_bytes{job=\"minio\"}[5m]))",
+              "refId": "A",
+              "legendFormat": "rx"
+            },
+            {
+              "expr": "sum(rate(minio_s3_traffic_sent_bytes{job=\"minio\"}[5m]))",
+              "refId": "B",
+              "legendFormat": "tx"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "Bps"
+            }
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 12,
+            "x": 12,
+            "y": 37
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "lastNotNull",
+                "mean",
+                "max"
+              ],
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

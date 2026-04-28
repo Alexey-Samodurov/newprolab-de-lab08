@@ -17,6 +17,16 @@ ARG KAFKA_CLIENTS_VERSION=3.4.1
 ARG COMMONS_POOL2_VERSION=2.11.1
 ARG MAVEN_BASE=https://repo1.maven.org/maven2
 
+# NB: НЕ добавляем io.prometheus:simpleclient* jars в classpath. Hudi 1.1.1
+# шейдит Dropwizard MetricRegistry в org.apache.hudi.com.codahale.metrics.*,
+# а стандартный simpleclient_dropwizard 0.x с Maven Central ожидает unshaded
+# com.codahale.metrics.MetricRegistry → при init нативного PROMETHEUS reporter
+# падает с NoSuchMethodError на DropwizardExports.<init>. Чтобы заработало, нужен
+# пересобранный shaded simpleclient_dropwizard под Hudi-shaded пакет; этого
+# bundle на Maven Central нет. Workaround: hoodie.metrics.on=false (см.
+# spark-jobs/hudi_utils.py) — наблюдаемость держим на Spark DAGScheduler
+# (PrometheusServlet, порт 4040) и file-based annotations из .hoodie/.
+
 WORKDIR /opt/spark/jars
 
 RUN set -eux; \
@@ -40,6 +50,11 @@ RUN pip install --no-cache-dir \
 
 # Sane дефолты для S3a (значения переопределяются через spark-conf SparkApplication)
 ENV SPARK_EXTRA_CLASSPATH=/opt/spark/jars/*
+
+# Metrics: PrometheusServlet sink (нативный для Spark 3.x). Конфиг применяется
+# автоматически ко всем driver/executor процессам, никаких CLI-флагов не нужно.
+# Подробности — в комментариях самого файла.
+COPY conf/metrics.properties /opt/spark/conf/metrics.properties
 
 USER spark
 WORKDIR /opt/spark/work-dir

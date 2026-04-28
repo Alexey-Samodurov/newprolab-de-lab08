@@ -11,6 +11,14 @@ webhook:
 controller:
   workers: 5
 
+# Включаем встроенный prometheus-эндпоинт оператора (контроллер reconcile-метрики,
+# webhook latency, queue depth). Скрейпится через ServiceMonitor в k8s/monitoring/.
+metrics:
+  enable: true
+  port: 8080
+  portName: metrics
+  endpoint: /metrics
+
 resources:
   requests:
     cpu: 100m

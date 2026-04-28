@@ -1,0 +1,21 @@
+---
+# Скрейп встроенных метрик Spark Operator (controller reconcile, webhook).
+# Endpoint включается в helm-values/spark-operator.yaml (metrics.enable=true).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spark-operator
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: lab08-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - data-platform
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spark-operator
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

@@ -37,6 +37,11 @@ tenant:
   features:
     bucketDNS: false
     domains: {}
+  # Публичный prometheus-эндпоинт (без JWT) — нужен для скрейпа Prometheus-ом без секрета.
+  # MinIO экспонирует /minio/v2/metrics/{cluster,node,bucket,resource} на порту 9000.
+  env:
+    - name: MINIO_PROMETHEUS_AUTH_TYPE
+      value: "public"
 
 ingress:
   api:

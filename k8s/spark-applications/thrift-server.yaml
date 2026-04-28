@@ -54,6 +54,19 @@ data:
     spark.sql.hive.thriftServer.singleSession     false
     spark.hadoop.hive.server2.thrift.port         10000
     spark.hadoop.hive.server2.thrift.bind.host    0.0.0.0
+
+    # Observability: фиксируем namespace метрик (см. bronze-s3-streaming.yaml).
+    spark.metrics.namespace                       spark
+    spark.sql.streaming.metricsEnabled            true
+    # Inline metrics config: Thrift запускается через start-thriftserver.sh с
+    # --properties-file → стандартный путь /opt/spark/conf/metrics.properties не
+    # читается. Передаём sink-конфиг напрямую через spark.metrics.conf.*.
+    spark.metrics.conf.*.sink.prometheusServlet.class       org.apache.spark.metrics.sink.PrometheusServlet
+    spark.metrics.conf.*.sink.prometheusServlet.path        /metrics/prometheus/
+    spark.metrics.conf.master.sink.prometheusServlet.path        /metrics/master/prometheus/
+    spark.metrics.conf.applications.sink.prometheusServlet.path  /metrics/applications/prometheus/
+    spark.metrics.conf.driver.source.jvm.class    org.apache.spark.metrics.source.JvmSource
+    spark.metrics.conf.executor.source.jvm.class  org.apache.spark.metrics.source.JvmSource
 ---
 # Headless service для driver RPC. Имя совпадает с hostname pod (subdomain),
 # что даёт стабильный DNS spark-thrift-driver-headless.spark-jobs.svc.cluster.local.
@@ -81,6 +94,8 @@ kind: Service
 metadata:
   name: spark-thrift-server
   namespace: spark-jobs
+  labels:
+    app: spark-thrift-server
 spec:
   type: ClusterIP
   selector:
@@ -142,6 +157,7 @@ spec:
               containerPort: 7078
             - name: blockmanager
               containerPort: 7079
+            # Hudi PROMETHEUS reporter выключен (см. spark-jobs/hudi_utils.py).
           volumeMounts:
             - name: conf
               mountPath: /opt/spark/conf/spark-defaults.conf

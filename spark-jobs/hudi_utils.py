@@ -129,14 +129,33 @@ def hudi_opts(
         "hoodie.metadata.enable": "true",
         "hoodie.metadata.index.column.stats.enable": "true",
         "hoodie.metadata.index.column.stats.column.list": column_stats_cols,
+
+        # --- observability: Hudi metrics OFF ----------------------------
+        # KNOWN ISSUE (Hudi 1.1.1): нативный PROMETHEUS reporter падает с
+        # NoSuchMethodError в io.prometheus.client.dropwizard.DropwizardExports
+        # при первом commit, потому что Hudi шейдит Dropwizard MetricRegistry
+        # в org.apache.hudi.com.codahale.metrics.*, а стандартный
+        # simpleclient_dropwizard с Maven Central линкуется на unshaded
+        # com.codahale.metrics. Совместимый shaded jar Hudi на Maven Central
+        # не публикует. PUSHGATEWAY требует разворачивания push-gw, JMX тоже
+        # тянет JmxSink + javaagent. Поэтому Hudi metrics выключены, а
+        # наблюдаемость build-ится на Spark DAGScheduler (PrometheusServlet
+        # порт 4040) — см. lab08/OBSERVABILITY_PLAN.md → Known issues.
+        "hoodie.metrics.on": "false",
     }
 
     # Record-level index: HFile в metadata, маппинг recordkey → fileId.
     # Для bronze с миллионами PK ускоряет upsert (vs default BLOOM).
-    # NB: в Hudi 1.x ключ переименован: record.index.enable → record.level.index.enable
-    if enable_record_index:
+    # NB: Hudi 1.1.1 имеет известный баг "File pruning with partitioned rli has not yet
+    # been implemented" — RLI несовместим с partitioned tables на read path. Для
+    # партиционированных таблиц форсим BLOOM (старый, но рабочий путь).
+    if enable_record_index and not partition_field:
         opts["hoodie.index.type"] = "RECORD_INDEX"
         opts["hoodie.metadata.record.level.index.enable"] = "true"
+    else:
+        # BLOOM index — file-skipping через bloom-фильтры в footers; работает с
+        # partitioned tables. Для bronze упорядочен по event_day → bloom попадание высокое.
+        opts["hoodie.index.type"] = "BLOOM"
 
     return opts
 

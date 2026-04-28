@@ -21,6 +21,8 @@ repositories:
     url: https://charts.bitnami.com/bitnami
   - name: ingress-nginx
     url: https://kubernetes.github.io/ingress-nginx
+  - name: prometheus-community
+    url: https://prometheus-community.github.io/helm-charts
 
 releases:
   # ==== Ingress ====
@@ -108,3 +110,26 @@ releases:
       - ingress-nginx/ingress-nginx
     values:
       - helm-values/superset.yaml
+
+  # ==== Observability ====
+  # kube-prometheus-stack: Prometheus Operator + Prometheus + Grafana + Alertmanager + kube-state-metrics.
+  # ServiceMonitor/PodMonitor для наших источников лежат в k8s/monitoring/ (применяются `make monitoring`).
+  - name: kube-prometheus-stack
+    namespace: monitoring
+    chart: prometheus-community/kube-prometheus-stack
+    version: "65.5.1"   # app v0.78 (Prometheus 2.55, Grafana 11.3)
+    createNamespace: true
+    needs:
+      - ingress-nginx/ingress-nginx
+    values:
+      - helm-values/monitoring-stack.yaml
+
+  # statsd → prometheus конвертер для Airflow метрик.
+  - name: prometheus-statsd-exporter
+    namespace: monitoring
+    chart: prometheus-community/prometheus-statsd-exporter
+    version: "0.13.0"
+    needs:
+      - monitoring/kube-prometheus-stack
+    values:
+      - helm-values/statsd-exporter.yaml

@@ -42,6 +42,16 @@ extraEnv: |
     value: "30"
   - name: AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL
     value: "15"
+  # === Metrics → statsd → prometheus-statsd-exporter (ns monitoring) ===
+  # Mapping rules в helm-values/statsd-exporter.yaml извлекают dag/task в полноценные labels.
+  - name: AIRFLOW__METRICS__STATSD_ON
+    value: "True"
+  - name: AIRFLOW__METRICS__STATSD_HOST
+    value: "prometheus-statsd-exporter.monitoring.svc.cluster.local"
+  - name: AIRFLOW__METRICS__STATSD_PORT
+    value: "9125"
+  - name: AIRFLOW__METRICS__STATSD_PREFIX
+    value: "airflow"
   # Удалённое логирование в MinIO — логи постоянны, видны в UI после удаления пода
   - name: AIRFLOW__LOGGING__REMOTE_LOGGING
     value: "True"

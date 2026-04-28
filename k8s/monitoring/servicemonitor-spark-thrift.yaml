@@ -1,0 +1,30 @@
+---
+# Скрейп Spark Thrift Server (long-lived Spark driver в client mode).
+# Service spark-thrift-server уже экспонирует порт 4040 (name: ui) — туда
+# PrometheusServlet (см. docker/spark/conf/metrics.properties) публикует
+# JVM/Spark/Hudi метрики на /metrics/prometheus/.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spark-thrift-server
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: lab08-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - spark-jobs
+  selector:
+    matchLabels:
+      app: spark-thrift-server
+  endpoints:
+    - port: ui
+      path: /metrics/prometheus/
+      interval: 30s
+      relabelings:
+        # Унифицируем лейбл с SparkApplication-ами — на дашборде один фильтр $spark_app.
+        - sourceLabels: [__meta_kubernetes_service_label_app]
+          targetLabel: spark_app_name
+    # NB: Hudi PROMETHEUS reporter (port 9091) выключен — несовместим с
+    # simpleclient_dropwizard из Maven Central в Hudi 1.1.1 (см. PodMonitor
+    # spark-applications и spark-jobs/hudi_utils.py).

@@ -56,6 +56,20 @@ spec:
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
     "spark.sql.streaming.numRecentProgressUpdates": "20"
+    # Observability: фиксируем namespace метрик (по умолчанию = spark.app.id, нестабилен).
+    # PrometheusServlet кладёт имена как metrics_<namespace>_<instance>_<source>_<metric>.
+    # С namespace=spark получаем единый префикс metrics_spark_* — дашборд использует его.
+    "spark.metrics.namespace": "spark"
+    "spark.sql.streaming.metricsEnabled": "true"
+    # Inline metrics config: Spark Operator перетирает /opt/spark/conf нашим
+    # ConfigMap-ом, поэтому metrics.properties из image теряется. Передаём конфиг
+    # через spark.metrics.conf.* — Spark раскладывает их как метрики-properties.
+    "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet"
+    "spark.metrics.conf.*.sink.prometheusServlet.path": "/metrics/prometheus/"
+    "spark.metrics.conf.master.sink.prometheusServlet.path": "/metrics/master/prometheus/"
+    "spark.metrics.conf.applications.sink.prometheusServlet.path": "/metrics/applications/prometheus/"
+    "spark.metrics.conf.driver.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
+    "spark.metrics.conf.executor.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
   driver:
     cores: 1
     coreLimit: "2000m"
@@ -63,6 +77,9 @@ spec:
     serviceAccount: spark
     labels:
       app: bronze-s3-streaming
+    # Hudi metrics OFF (Hudi 1.1.1 PROMETHEUS reporter несовместим с публичным
+    # simpleclient_dropwizard — см. spark-jobs/hudi_utils.py). Spark UI /
+    # PrometheusServlet висят на 4040 (открывается Spark Operator-ом по умолчанию).
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials

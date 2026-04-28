@@ -1,7 +1,8 @@
 .PHONY: help check up down ns secrets diff status spark-image hms \
         spark-code dbt-configmap airflow-dags airflow-trigger-pipeline superset-init \
         ingress hosts images airflow-image hms-image rbac thrift airflow-unpause wait-airflow ensure-buckets verify-trino \
-        bootstrap-pipeline seed-data streaming-apps kafka-streaming-app
+        bootstrap-pipeline seed-data streaming-apps kafka-streaming-app \
+        monitoring monitoring-dashboards
 
 KIND_CONTEXT ?= docker-desktop
 SAMPLE_DIR ?= lab08/sample
@@ -25,6 +26,8 @@ help:
 	@echo "  make spark-code               - пересоздать ConfigMap spark-jobs-code из spark-jobs/*.py"
 	@echo "  make dbt-configmap            - пересоздать ConfigMap dbt-project из dbt/"
 	@echo "  make ingress                  - применить Ingress-ресурсы (airflow/superset/trino/minio)"
+	@echo "  make monitoring               - применить ServiceMonitor/PodMonitor + Grafana dashboards"
+	@echo "  make monitoring-dashboards    - пересоздать ConfigMap c Grafana дашбордами"
 	@echo "  make hosts                    - добавить *.lab08.local в /etc/hosts (требует sudo)"
 	@echo "  make airflow-dags             - скопировать airflow/dags/ в под Airflow scheduler"
 	@echo "  make airflow-unpause          - снять с паузы DAG transactions_pipeline"
@@ -89,6 +92,7 @@ up: ns secrets images
 	$(MAKE) thrift
 	$(MAKE) streaming-apps
 	$(MAKE) ingress
+	$(MAKE) monitoring
 	@echo "    Ожидаю Airflow scheduler..."
 	kubectl -n data-platform wait --for=condition=ready pod -l component=scheduler --timeout=300s
 	@echo ">>> [3/3] Bootstrap пайплайна и Superset..."
@@ -104,6 +108,7 @@ up: ns secrets images
 	@echo "    Superset : http://superset.lab08.local"
 	@echo "    Trino    : http://trino.lab08.local"
 	@echo "    MinIO S3 : http://s3.lab08.local"
+	@echo "    Grafana  : http://grafana.lab08.local   (admin/admin)"
 	@echo "  (Если *.lab08.local не резолвятся — сделай 'make hosts')"
 	@echo "================================================================"
 
@@ -269,18 +274,46 @@ dbt-configmap:
 # Применяет Ingress ресурсы для всех UI-сервисов (nginx-ingress должен быть запущен).
 ingress:
 	kubectl apply -f k8s/ingress.yaml >/dev/null
+	kubectl apply -f k8s/monitoring/ingress.yaml >/dev/null
+
+# Observability: ServiceMonitor / PodMonitor + Grafana dashboards.
+# kube-prometheus-stack уже поднят helmfile-ом; здесь — наша конфигурация скрейпа
+# и набор дашбордов lab08. Идемпотентно: kubectl apply.
+monitoring: monitoring-dashboards
+	kubectl apply -f k8s/monitoring/namespace.yaml >/dev/null
+	kubectl apply -f k8s/monitoring/servicemonitor-spark-operator.yaml >/dev/null
+	kubectl apply -f k8s/monitoring/servicemonitor-spark-thrift.yaml >/dev/null
+	kubectl apply -f k8s/monitoring/podmonitor-spark-applications.yaml >/dev/null
+	kubectl apply -f k8s/monitoring/servicemonitor-minio.yaml >/dev/null
+	@echo ">>> Monitoring objects applied. Grafana → http://grafana.lab08.local (admin/admin)."
+
+# ConfigMap с дашбордами Grafana — sidecar grafana подхватывает любые ConfigMap
+# с label grafana_dashboard=1 в любом namespace и публикует JSON в Grafana.
+# Идемпотентно: dry-run | apply.
+monitoring-dashboards:
+	kubectl apply -f k8s/monitoring/namespace.yaml >/dev/null
+	kubectl -n monitoring create configmap grafana-dashboard-lab08-overview \
+	  --from-file=lab08-overview.json=k8s/monitoring/dashboards/lab08-overview.json \
+	  --dry-run=client -o yaml | \
+	  kubectl label --local -f - --dry-run=client -o yaml \
+	    grafana_dashboard=1 | \
+	  kubectl annotate --local -f - --dry-run=client -o yaml \
+	    grafana_folder=lab08 | \
+	  kubectl apply -f - >/dev/null
 
 # Добавляет *.lab08.local в /etc/hosts (требует sudo).
 # Идемпотентен: не дублирует строки при повторном запуске.
 hosts:
-	@for host in airflow.lab08.local superset.lab08.local trino.lab08.local s3.lab08.local; do \
+	@for host in airflow.lab08.local superset.lab08.local trino.lab08.local s3.lab08.local grafana.lab08.local prometheus.lab08.local; do \
 	  grep -q "$$host" /etc/hosts || echo "127.0.0.1 $$host" | sudo tee -a /etc/hosts; \
 	done
 	@echo "Готово:"
-	@echo "  http://airflow.lab08.local   — Airflow UI"
-	@echo "  http://superset.lab08.local  — Superset UI"
-	@echo "  http://trino.lab08.local     — Trino UI"
-	@echo "  http://s3.lab08.local        — MinIO S3 API (mc alias set lab08 http://s3.lab08.local ...)"
+	@echo "  http://airflow.lab08.local    — Airflow UI"
+	@echo "  http://superset.lab08.local   — Superset UI"
+	@echo "  http://trino.lab08.local      — Trino UI"
+	@echo "  http://s3.lab08.local         — MinIO S3 API"
+	@echo "  http://grafana.lab08.local    — Grafana (admin/admin)"
+	@echo "  http://prometheus.lab08.local — Prometheus"
 
 # Загружает DAG-файлы в MinIO bucket s3://artifacts/dags/.
 # В make up вызывается ДО helmfile sync для Airflow → initContainer dag-init подхватит
