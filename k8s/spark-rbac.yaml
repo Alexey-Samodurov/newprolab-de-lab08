@@ -32,6 +32,3 @@ subjects:
     name: spark
     namespace: spark-jobs
 ---
-# RoleBinding в data-platform — чтобы Thrift Service из spark-jobs мог быть достижим,
-# а также чтобы driver мог создавать configmaps/secrets для логов в namespace data-platform не нужен —
-# driver работает в spark-jobs. Достаточно одной роли в spark-jobs.

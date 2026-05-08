@@ -1,6 +1,6 @@
 .PHONY: help check up down ns secrets diff status spark-image hms \
         spark-code dbt-configmap airflow-dags airflow-trigger-pipeline superset-init \
-        ingress hosts images airflow-image hms-image rbac thrift airflow-unpause wait-airflow ensure-buckets verify-trino \
+        ingress hosts images airflow-image hms-image rbac airflow-unpause wait-airflow ensure-buckets verify-trino \
         bootstrap-pipeline seed-data streaming-apps kafka-streaming-app \
         monitoring monitoring-dashboards
 
@@ -20,7 +20,6 @@ help:
 	@echo "  make images                   - собрать все кастомные image (skip если уже есть)"
 	@echo "  make hms                      - применить hive-metastore deployment"
 	@echo "  make rbac                     - применить spark-rbac, airflow-rbac"
-	@echo "  make thrift                   - применить thrift-server.yaml"
 	@echo "  make streaming-apps           - применить long-running streaming SparkApplications (S3 + Kafka)"
 	@echo "  make ensure-buckets           - убедиться что lake bucket существует (для существующего MinIO)"
 	@echo "  make spark-code               - пересоздать ConfigMap spark-jobs-code из spark-jobs/*.py"
@@ -72,8 +71,12 @@ images: spark-image airflow-image hms-image
 
 # === ОДНА КОМАНДА: полностью идемпотентная установка ===
 # 1. namespaces  2. secrets  3. images  4. helmfile sync (MinIO/HMS-pg/Spark-Op/Trino/Superset/Airflow/Ingress)
-# 5. HMS deployment  6. lake bucket  7. RBAC  8. configmaps (spark-code, dbt-project)  9. Thrift Server
+# 5. HMS deployment  6. lake bucket  7. RBAC  8. configmaps (spark-code, dbt-project)  9. streaming SparkApps
 # 10. Ingress  11. DAG'и + unpause  12. verify Trino
+#
+# Spark Thrift Server убран — dbt теперь запускается как SparkApplication через
+# SparkKubernetesOperator (см. lab08/MIGRATION_THRIFT_TO_OPERATOR.md). BI-запросы
+# идут через Trino, ad-hoc — `kubectl exec deploy/trino-coordinator -- trino`.
 up: ns secrets images
 	@echo ">>> [1/3] MinIO (storage)..."
 	helmfile --quiet -l name=minio-operator sync
@@ -89,7 +92,6 @@ up: ns secrets images
 	$(MAKE) rbac
 	$(MAKE) spark-code
 	$(MAKE) dbt-configmap
-	$(MAKE) thrift
 	$(MAKE) streaming-apps
 	$(MAKE) ingress
 	$(MAKE) monitoring
@@ -121,11 +123,6 @@ hms:
 rbac:
 	kubectl apply -f k8s/spark-rbac.yaml >/dev/null
 	kubectl apply -f k8s/airflow-rbac.yaml >/dev/null
-
-# Spark Thrift Server (Deployment + 2 Service + configmap). Идемпотентно через kubectl apply.
-thrift:
-	kubectl apply -f k8s/spark-applications/thrift-server.yaml >/dev/null
-	kubectl -n spark-jobs rollout status deployment/spark-thrift-server --timeout=300s
 
 # Long-running streaming SparkApplications: bronze.* ingest из S3 (file source).
 # SparkApp декларативный (restartPolicy: Always + checkpoints на S3),
@@ -213,10 +210,9 @@ down:
 	@echo ">>> 1/6 Удаляю SparkApplication-инстансы (могут блокировать ns terminate)..."
 	-kubectl -n spark-jobs delete sparkapplication --all --ignore-not-found --wait=false
 	-kubectl -n spark-jobs delete scheduledsparkapplication --all --ignore-not-found --wait=false
-	@echo ">>> 2/6 Удаляю ручные манифесты (HMS / Thrift / streaming / Ingress / RBAC / secrets)..."
+	@echo ">>> 2/6 Удаляю ручные манифесты (HMS / streaming / Ingress / RBAC / secrets)..."
 	-kubectl delete -f k8s/spark-applications/bronze-s3-streaming.yaml --ignore-not-found
 	-kubectl delete -f k8s/spark-applications/bronze-kafka-ingest.yaml --ignore-not-found
-	-kubectl delete -f k8s/spark-applications/thrift-server.yaml --ignore-not-found
 	-kubectl delete -f k8s/hive-metastore.yaml --ignore-not-found
 	-kubectl delete -f k8s/ingress.yaml --ignore-not-found
 	-kubectl delete -f k8s/airflow-rbac.yaml --ignore-not-found
@@ -282,7 +278,6 @@ ingress:
 monitoring: monitoring-dashboards
 	kubectl apply -f k8s/monitoring/namespace.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/servicemonitor-spark-operator.yaml >/dev/null
-	kubectl apply -f k8s/monitoring/servicemonitor-spark-thrift.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/podmonitor-spark-applications.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/servicemonitor-minio.yaml >/dev/null
 	@echo ">>> Monitoring objects applied. Grafana → http://grafana.lab08.local (admin/admin)."

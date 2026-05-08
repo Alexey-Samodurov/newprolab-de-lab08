@@ -16,30 +16,29 @@ Kafka (внешний)            ──► PySpark Structured Streaming (long-r
                                              ▼
                             Hudi CoW tables (bronze/silver/gold) on MinIO
                                               │
-                           ┌──────────────────┼──────────────────────────┐
-                           ▼                  ▼                          ▼
-                  Spark Thrift Server      Trino 470+               Trino → Superset
-                  (client mode, HMS)       (read-only Hudi)         (dashboards)
-                  ▲ JDBC :10000
-                  │
+                                              ▼
+                                   Trino 470+ ──► Superset (dashboards)
+                                   (read-only Hudi)
+
             Long-running streaming SparkApplications (k8s, applied via `make up`):
               bronze-s3-streaming    (file source → bronze.* upsert; restartPolicy: Always)
               bronze-kafka-ingest    (Kafka source → bronze.events_kafka)
 
             Airflow DAGs (KubernetesExecutor):
-              transactions_pipeline  (PythonSensor ждёт bronze rows → dbt silver → gold → test, */30 min)
+              transactions_pipeline  (PythonSensor ждёт bronze rows → 3 SparkApplication
+                                      через SparkKubernetesOperator: dbt silver → gold → test, */30 min)
 ```
 
 **Стек:**
 
 | Компонент | Версия | Роль |
 |---|---|---|
-| Apache Spark | 3.5.8 | structured streaming (S3 + Kafka), thrift server |
+| Apache Spark | 3.5.8 | structured streaming (S3 + Kafka), dbt driver через SparkApplication CRD |
 | Apache Hudi | 1.1.1 (CoW) | формат таблиц bronze/silver/gold |
 | MinIO | 6.x | локальное S3-совместимое хранилище |
 | Hive Metastore | 3.0.0 (postgres) | каталог таблиц |
-| Trino | 470 | read-only query engine для BI |
-| dbt-spark | 1.8.0 (thrift) | трансформации silver/gold |
+| Trino | 470 | read-only query engine для BI и ad-hoc SQL |
+| dbt-spark | 1.8.0 (session, через SparkApplication CRD) | трансформации silver/gold |
 | Apache Airflow | 2.10.4 (KubernetesExecutor) | оркестрация |
 | Apache Superset | 4.x | дашборды |
 | Kubernetes | kind / docker-desktop | runtime |
@@ -236,8 +235,13 @@ reference). Чекпойнты на `s3a://hudi/.checkpoints/bronze-s3-stream/*`
 что рестарт SparkApplication продолжает с offset'а. Дедупликация и поздние
 перезаливки файлов закрываются Hudi upsert'ом по `composite_pk`/`record_key`.
 
-**dbt-таски** запускаются через `KubernetesPodOperator` с образом `lab08/spark:3.5.8-hudi-1.1.1`,
-который содержит dbt-core + dbt-spark. Проект dbt разворачивается из ConfigMap `dbt-project`.
+**dbt-таски** запускаются через `SparkKubernetesOperator` — каждая создаёт
+`SparkApplication` CR (`apiVersion: sparkoperator.k8s.io/v1beta2`) с образом
+`lab08/spark:3.5.8-hudi-1.1.1`. Driver pod выполняет `spark-submit run_dbt.py …`,
+dbt-spark с `method: session` подцепляет уже сконфигурированный SparkSession
+(HMS uri, S3, Hudi extensions передаются через `sparkConf`). Проект dbt
+разворачивается из ConfigMap `dbt-project`. См. подробности в
+`lab08/MIGRATION_THRIFT_TO_OPERATOR.md`.
 
 ---
 
@@ -269,11 +273,12 @@ lab08/
 │   ├── airflow-rbac.yaml
 │   └── spark-applications/
 │       ├── bronze-s3-streaming.yaml
-│       ├── bronze-kafka-ingest.yaml
-│       └── thrift-server.yaml
+│       └── bronze-kafka-ingest.yaml
 ├── spark-jobs/                  # PySpark скрипты (единственный источник правды)
 │   ├── bronze_s3_streaming.py
-│   └── bronze_kafka_ingest.py
+│   ├── bronze_kafka_ingest.py
+│   ├── hudi_utils.py
+│   └── run_dbt.py               # shim: spark-submit-обёртка для dbt CLI
 ├── dbt/
 │   ├── dbt_project.yml
 │   ├── profiles.yml

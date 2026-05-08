@@ -26,10 +26,6 @@ from pyspark.sql.types import (
 from hudi_utils import hudi_opts, write_hudi
 
 
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-
 TX_SCHEMA = StructType([
     StructField("transaction_id", LongType(), True),
     StructField("user_id", LongType(), True),
@@ -95,15 +91,6 @@ PROMO_CODES_SCHEMA = StructType([
     StructField("expiry_date", StringType(), True),
 ])
 
-
-# ---------------------------------------------------------------------------
-# Hudi helpers (общая реализация в spark-jobs/hudi_utils.py)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Per-stream foreachBatch handlers
-# ---------------------------------------------------------------------------
 
 def handle_transactions(batch_df: DataFrame, batch_id: int) -> None:
     if batch_df.rdd.isEmpty():
@@ -210,10 +197,6 @@ def handle_reference(spark: SparkSession, src_root: str, batch_df: DataFrame, ba
         print(f"[ref batch={batch_id}] upserted {table} from {fname}")
 
 
-# ---------------------------------------------------------------------------
-# Stream builder
-# ---------------------------------------------------------------------------
-
 def start_file_stream(
     spark: SparkSession,
     *,
@@ -239,9 +222,6 @@ def start_file_stream(
         reader = reader.schema(schema)
 
     df = reader.load(path)
-    # `_metadata` — скрытая колонка file source (Spark 3.3+). Она не попадает
-    # в `select("*")` и не доходит до foreachBatch автоматически — надо явно
-    # спроецировать нужное поле в схему стрима.
     if include_source_path:
         df = df.select("*", F.col("_metadata.file_path").alias("_source_path"))
 

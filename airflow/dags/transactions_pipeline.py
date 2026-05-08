@@ -12,6 +12,13 @@ DAG крутится по cron `*/30`. На первом запуске (пос�
 поллит Trino через `TrinoHook` пока в `hudi.bronze.transactions` не появятся
 строки. Только после этого dbt силвер/голд гоняется. На последующих запусках
 sensor проходит мгновенно.
+
+dbt-таски запускаются через `SparkKubernetesOperator` — каждая создаёт
+SparkApplication CR (`apiVersion: sparkoperator.k8s.io/v1beta2`), driver
+которого выполняет `spark-submit run_dbt.py <args>`. dbt-spark с
+`method: session` подцепляет уже сконфигурированный SparkSession (HMS,
+S3, Hudi extensions передаются через `sparkConf`). Thrift Server больше
+не нужен — см. lab08/MIGRATION_THRIFT_TO_OPERATOR.md.
 """
 from __future__ import annotations
 
@@ -19,15 +26,12 @@ from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
 from airflow.operators.python import ShortCircuitOperator
-from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import SparkKubernetesOperator
 from airflow.sensors.python import PythonSensor
-from kubernetes.client import models as k8s
 
 NAMESPACE = "spark-jobs"
-# Если предыдущий success моложе этого порога — текущий scheduled run пропускаем.
-# Закрывает дублирующий пересчёт когда long-running run (cold-start Spark + sensor +
-# dbt ≈ 10 мин) пересекается со следующим cron-тиком */30.
-SKIP_IF_RECENT_SUCCESS_MINUTES = 25
+SPARK_IMAGE = "lab08/spark:3.5.8-hudi-1.1.1"
+SKIP_IF_RECENT_SUCCESS_MINUTES = 40
 
 
 def _bronze_has_rows() -> bool:
@@ -49,41 +53,106 @@ def _bronze_has_rows() -> bool:
         return False
 
 
-DBT_INIT_SCRIPT_PATH = "/tmp/cm/dbt-init.sh"
-"""Путь к общему init-скрипту внутри pod (см. dbt/dbt-init.sh).
+SPARK_CONF: dict[str, str] = {
+    "spark.sql.catalogImplementation": "hive",
+    "spark.sql.warehouse.dir": "s3a://warehouse/",
+    "spark.sql.extensions": "org.apache.spark.sql.hudi.HoodieSparkSessionExtension",
+    "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+    "spark.kryo.registrator": "org.apache.spark.HoodieSparkKryoRegistrar",
+    "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.hudi.catalog.HoodieCatalog",
+    "spark.hadoop.hive.metastore.uris": "thrift://hive-metastore.data-platform.svc.cluster.local:9083",
+    "spark.hadoop.fs.s3a.endpoint": "http://minio.storage.svc.cluster.local",
+    "spark.hadoop.fs.s3a.path.style.access": "true",
+    "spark.hadoop.fs.s3a.connection.ssl.enabled": "false",
+    "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+    "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider",
+    "spark.kubernetes.namespace": NAMESPACE,
+    "spark.kubernetes.executor.deleteOnTermination": "true",
+    "spark.metrics.namespace": "spark",
+    "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet",
+    "spark.metrics.conf.*.sink.prometheusServlet.path": "/metrics/prometheus/",
+    "spark.metrics.conf.driver.source.jvm.class": "org.apache.spark.metrics.source.JvmSource",
+    "spark.metrics.conf.executor.source.jvm.class": "org.apache.spark.metrics.source.JvmSource",
+}
 
-Раскладывает flat-configmap dbt-project в dbt-структуру.
-"""
+_AWS_ENV_REFS = {
+    "AWS_ACCESS_KEY_ID": {"name": "lab08-credentials", "key": "AWS_ACCESS_KEY_ID"},
+    "AWS_SECRET_ACCESS_KEY": {"name": "lab08-credentials", "key": "AWS_SECRET_ACCESS_KEY"},
+}
 
-dbt_volumes = [
-    k8s.V1Volume(name="cm", config_map=k8s.V1ConfigMapVolumeSource(name="dbt-project")),
-    k8s.V1Volume(name="workdir", empty_dir=k8s.V1EmptyDirVolumeSource()),
+DRIVER_BASE: dict = {
+    "cores": 1,
+    "coreLimit": "2000m",
+    "memory": "1500m",
+    "serviceAccount": "spark",
+    "envSecretKeyRefs": _AWS_ENV_REFS,
+    "volumeMounts": [
+        {"name": "jobs-code", "mountPath": "/opt/spark/jobs"},
+        {"name": "dbt-cm", "mountPath": "/tmp/cm"},
+    ],
+}
+
+EXECUTOR_BASE: dict = {
+    "cores": 1,
+    "instances": 1,
+    "memory": "1500m",
+    "envSecretKeyRefs": _AWS_ENV_REFS,
+}
+
+VOLUMES: list[dict] = [
+    {"name": "jobs-code", "configMap": {"name": "spark-jobs-code"}},
+    {"name": "dbt-cm", "configMap": {"name": "dbt-project"}},
 ]
-dbt_volume_mounts = [
-    k8s.V1VolumeMount(name="cm", mount_path="/tmp/cm"),
-    k8s.V1VolumeMount(name="workdir", mount_path="/tmp/dbt-project"),
-]
-dbt_env = [k8s.V1EnvVar(name="DBT_PROFILES_DIR", value="/tmp/dbt-project")]
-dbt_image = "lab08/spark:3.5.8-hudi-1.1.1"
 
 
-def make_dbt_task(task_id: str, dbt_args: str) -> KubernetesPodOperator:
-    return KubernetesPodOperator(
+def _build_dbt_spec(step: str, dbt_args: list[str]) -> dict:
+    """SparkApplication-манифест для конкретного dbt-шага.
+
+    `step` ∈ {silver, gold, test}. Имя CR-а суффиксуется Jinja-шаблоном
+    `ts_nodash` — даёт уникальность per task instance.
+    """
+    return {
+        "apiVersion": "sparkoperator.k8s.io/v1beta2",
+        "kind": "SparkApplication",
+        "metadata": {
+            "name": f"dbt-{step}-" + "{{ ts_nodash | lower }}",
+            "namespace": NAMESPACE,
+        },
+        "spec": {
+            "type": "Python",
+            "pythonVersion": "3",
+            "mode": "cluster",
+            "image": SPARK_IMAGE,
+            "imagePullPolicy": "IfNotPresent",
+            "mainApplicationFile": "local:///opt/spark/jobs/run_dbt.py",
+            "arguments": dbt_args,
+            "sparkVersion": "3.5.8",
+            # dbt должен либо пройти, либо упасть; перезапуск повторно прогонит модели.
+            "restartPolicy": {"type": "Never"},
+            "sparkConf": SPARK_CONF,
+            "driver": {**DRIVER_BASE, "labels": {"app": f"dbt-{step}"}},
+            "executor": {**EXECUTOR_BASE, "labels": {"app": f"dbt-{step}"}},
+            "volumes": VOLUMES,
+        },
+    }
+
+
+def make_dbt_spark_task(task_id: str, dbt_args: list[str]) -> SparkKubernetesOperator:
+    step = task_id.replace("dbt_", "")
+    return SparkKubernetesOperator(
         task_id=task_id,
         namespace=NAMESPACE,
-        image=dbt_image,
-        image_pull_policy="IfNotPresent",
-        service_account_name="spark",
-        cmds=["sh", "-c"],
-        arguments=[f"sh {DBT_INIT_SCRIPT_PATH} && cd /tmp/dbt-project && dbt {dbt_args} --no-version-check"],
-        volumes=dbt_volumes,
-        volume_mounts=dbt_volume_mounts,
-        env_vars=dbt_env,
+        template_spec=_build_dbt_spec(step, dbt_args),
+        kubernetes_conn_id="kubernetes_default",
         get_logs=True,
+        delete_on_termination=True,
         do_xcom_push=False,
-        is_delete_operator_pod=True,
-        in_cluster=True,
-        startup_timeout_seconds=180,
+        # cold-start image-pull может занять время на свежем ноде.
+        startup_timeout_seconds=600,
+        # default; на restart scheduler-а — найти уже созданный SparkApplication.
+        reattach_on_restart=True,
+        # не копим завершённые SparkApplication CR.
+        success_run_history_limit=1,
     )
 
 
@@ -126,7 +195,7 @@ def _skip_if_recent_success(**context) -> bool:
 
 with DAG(
     dag_id="transactions_pipeline",
-    description="wait bronze (streaming) → dbt silver → gold → tests",
+    description="wait bronze (streaming) → dbt silver → gold → tests (через SparkApplication CRD)",
     start_date=datetime(2025, 10, 6),
     schedule="*/30 * * * *",
     catchup=False,
@@ -134,21 +203,12 @@ with DAG(
     default_args={"owner": "lab08"},
     tags=["lab08", "hudi", "dbt"],
 ) as dag:
-    # ShortCircuit: пропускаем scheduled run, если предыдущий success был
-    # < SKIP_IF_RECENT_SUCCESS_MINUTES минут назад. Cron */30 + cold-start
-    # ~10 мин раньше давал 2 пересчёта подряд (15:00 и 15:30 на одних и тех
-    # же данных). Manual run от bootstrap'а всегда проходит.
     skip_if_recent = ShortCircuitOperator(
         task_id="skip_if_recent_success",
         python_callable=_skip_if_recent_success,
-        # ignore_downstream_trigger_rules=False даёт downstream корректный 'skipped',
-        # а не 'upstream_failed' — DAGRun помечается success.
         ignore_downstream_trigger_rules=False,
     )
 
-    # Sensor с mode='reschedule' освобождает worker-slot между poke,
-    # чтобы первый запуск (cold-start Spark может занять до 5-10 мин)
-    # не держал ресурсы. timeout=30 мин — fail-fast если streaming не поднялся.
     wait_bronze = PythonSensor(
         task_id="wait_bronze_ready",
         python_callable=_bronze_has_rows,
@@ -157,9 +217,8 @@ with DAG(
         mode="reschedule",
     )
 
-    dbt_silver = make_dbt_task("dbt_silver", "run --select silver")
-    dbt_gold = make_dbt_task("dbt_gold", "run --select gold")
-    dbt_test = make_dbt_task("dbt_test", "test")
+    dbt_silver = make_dbt_spark_task("dbt_silver", ["run", "--select", "silver"])
+    dbt_gold = make_dbt_spark_task("dbt_gold", ["run", "--select", "gold"])
+    dbt_test = make_dbt_spark_task("dbt_test", ["test"])
 
     skip_if_recent >> wait_bronze >> dbt_silver >> dbt_gold >> dbt_test
-

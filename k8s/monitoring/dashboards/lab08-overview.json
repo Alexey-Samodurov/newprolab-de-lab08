@@ -40,7 +40,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 4,
+  "version": 5,
   "refresh": "30s",
   "time": {
     "from": "now-1h",
@@ -62,9 +62,9 @@
       {
         "name": "layer",
         "label": "Layer",
-        "description": "Виртуальный фильтр по слою lakehouse. ⚠️ Все слои работают на Spark, но через разные процессы:\n• Bronze — отдельные SparkApplication-ы (bronze-s3-streaming, bronze-kafka-ingest), запускаемые spark-operator-ом\n• Silver / Gold — dbt-модели, исполняются через долгоживущий Spark Thrift Server (spark_app_name=spark-thrift-server)\nПоэтому при выборе Silver или Gold в Spark-панелях вы видите ОДИН и тот же Thrift driver — слои разделяются на уровне Airflow задач ($layer_task), а не на уровне Spark процесса.",
+        "description": "Виртуальный фильтр по слою lakehouse. Все Spark-нагрузки в lab08 теперь идут через Spark Operator (SparkApplication CRD), но по lifecycle делятся на две группы:\n\n• Bronze — два long-running streaming SparkApplication-а: `bronze-s3-streaming`, `bronze-kafka-ingest`. Driver и executors живут постоянно, запускаются `make streaming-apps` (kubectl apply).\n• Silver — per-run batch SparkApplication `dbt-silver-<ts>`, который Airflow создаёт через `SparkKubernetesOperator` (task `dbt_silver` в `transactions_pipeline`). Driver живёт ~30–60с — выполняет `dbt run --select silver` и завершается.\n• Gold — два per-run SparkApplication-а: `dbt-gold-<ts>` (task `dbt_gold`) и `dbt-test-<ts>` (task `dbt_test`).\n\nПоэтому `$spark_app` для Silver/Gold будет содержать список запусков за выбранное время (по одному на каждый DAG-run, */30 cron). Большинство Spark-панелей показывают такие run-ы как короткие всплески — это норма.",
         "type": "custom",
-        "query": "All : .*,Bronze : bronze-.*,Silver : spark-thrift-server,Gold : spark-thrift-server",
+        "query": "All : .*,Bronze : bronze-.*,Silver : dbt-silver-.*,Gold : dbt-gold-.*|dbt-test-.*",
         "options": [
           {
             "selected": true,
@@ -79,12 +79,12 @@
           {
             "selected": false,
             "text": "Silver",
-            "value": "spark-thrift-server"
+            "value": "dbt-silver-.*"
           },
           {
             "selected": false,
             "text": "Gold",
-            "value": "spark-thrift-server"
+            "value": "dbt-gold-.*|dbt-test-.*"
           }
         ],
         "current": {
@@ -148,7 +148,7 @@
           "value": "$__all"
         },
         "label": "Spark App",
-        "description": "Список Spark-драйверов, экспортирующих метрики через Prometheus servlet (port 4040). Сейчас здесь будут до 3 значений:\n• bronze-s3-streaming — Structured Streaming SparkApplication (bronze слой)\n• bronze-kafka-ingest — Structured Streaming SparkApplication (bronze слой)\n• spark-thrift-server — общий долгоживущий Spark driver, на котором dbt выполняет МОДЕЛИ silver и gold слоёв\nЕсли выбран Silver или Gold в $layer — здесь автоматически останется только spark-thrift-server."
+        "description": "Список Spark-драйверов, экспортирующих метрики через Prometheus servlet (port 4040). Сейчас здесь могут появиться следующие значения:\n• bronze-s3-streaming — Structured Streaming SparkApplication (bronze слой, постоянно)\n• bronze-kafka-ingest — Structured Streaming SparkApplication (bronze слой, постоянно)\n• dbt-silver-<ts>, dbt-gold-<ts>, dbt-test-<ts> — per-run dbt SparkApplication-ы (silver / gold), создаются Airflow-DAG-ом transactions_pipeline на каждый запуск.\nПри выборе Silver/Gold в $layer фильтр спрячет всё, кроме соответствующих dbt-* приложений."
       },
       {
         "name": "dag",
@@ -210,7 +210,7 @@
     {
       "type": "row",
       "id": 100,
-      "title": "Pipeline health  —  $layer",
+      "title": "Pipeline health",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -224,7 +224,7 @@
       "type": "stat",
       "id": 1,
       "title": "Spark drivers up",
-      "description": "count(up{spark_app_name=~\"$layer\", spark_app_name!=\"\"} == 1) — считаем только реальные Spark-драйверы (есть label spark_app_name). Без spark_app_name!=\"\" в подсчёт попадали бы все остальные up-цели кластера (apiserver, kubelet, minio, …) — у них spark_app_name отсутствует, а regex .* матчит и пустую строку. Зелёный = есть хотя бы один живой driver в выбранном слое, красный = ни одного.",
+      "description": "count(up{spark_app_name=~\"$layer\", spark_app_name!=\"\"} == 1) — считаем только реальные Spark-драйверы (есть label spark_app_name). Без `spark_app_name!=\"\"` в подсчёт попадали бы все остальные up-цели кластера (apiserver, kubelet, minio, …) — у них spark_app_name отсутствует, а regex `.*` матчит и пустую строку.\n\n⚠️ Семантика разная по слоям:\n• Bronze — два long-running streaming SparkApplication-а, ожидаемо стабильно >=2.\n• Silver / Gold — per-run dbt SparkApplication-ы (dbt-silver/gold/test-<ts>), driver живёт 30–60с, поэтому большую часть времени here будет 0. Красный для Silver/Gold = норма, не инцидент.\n• All — обычно 2 (bronze) + краткие всплески до 5 во время dbt-runs.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -274,7 +274,7 @@
     {
       "type": "stat",
       "id": 2,
-      "title": "Airflow scheduler heartbeat / min",
+      "title": "Scheduler heartbeat (per min)",
       "description": "rate(airflow_scheduler_heartbeat[5m]) * 60. Норма >=10. <5 = шедулер деградирует. Не зависит от $layer (общий компонент).",
       "datasource": {
         "type": "prometheus",
@@ -330,7 +330,7 @@
     {
       "type": "stat",
       "id": 3,
-      "title": "Failures total (5m)",
+      "title": "Failures (5m)",
       "description": "Сумма Airflow ti_failures + Spark Operator app failures за 5 минут. Один индикатор «есть ли инциденты». 0 = тишина, >=5 = инцидент. Аннотации failures видны на всех time series.",
       "datasource": {
         "type": "prometheus",
@@ -442,7 +442,7 @@
     {
       "type": "row",
       "id": 200,
-      "title": "Spark  ($layer · $spark_app)  —  RED",
+      "title": "Spark",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -455,8 +455,8 @@
     {
       "type": "timeseries",
       "id": 10,
-      "title": "Throughput — streaming input rows/s",
-      "description": "RATE. metrics_spark_driver_spark_streaming_<query>_inputRate_total_Value. Плоско в 0 при активном источнике = streaming остановился. Для silver/gold (Thrift) метрики не будет — это нормально.",
+      "title": "Streaming input rate",
+      "description": "RATE. metrics_spark_driver_spark_streaming_<query>_inputRate_total_Value. Источник — Spark Structured Streaming (есть только у bronze-s3-streaming / bronze-kafka-ingest).\n\n• Bronze: плоско в 0 при активном источнике = streaming остановился (тревога).\n• Silver / Gold: панель пустая — это норма. dbt-таски запускаются как batch SparkApplication через SparkKubernetesOperator и не используют structured streaming. Прогресс silver/gold смотри в `Spark write activity` (jobs/min) и в Airflow-секции (task duration / failures).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -501,8 +501,8 @@
     {
       "type": "timeseries",
       "id": 12,
-      "title": "Saturation — JVM heap % + GC time %",
-      "description": "Левая ось — driver heap (%, threshold lines 75/90). Правая ось — доля времени в GC (% wall clock, сумма по всем известным GC-пулам: Copy/MarkSweepCompact, PS, G1; недостающие пулы fallback в 0 чтобы суммирование не схлопывалось до пустого вектора). Heap >90 длительно или GC >5 = риск OOM/деградации throughput.\n\nNB: select `{__name__=~\".+_time_Value\"}` + rate() приводит к invalid vector (rate() strips __name__ → пулы Copy и MarkSweepCompact становятся идентичными labelset-ами и aggregator падает с \"vector cannot contain metrics with the same labelset\"). Поэтому каждый пул считаем отдельным rate() и суммируем явно.",
+      "title": "JVM heap & GC time",
+      "description": "Левая ось — driver heap (%, threshold lines 75/90). Правая ось — доля времени в GC (% wall clock, сумма по всем известным GC-пулам: Copy/MarkSweepCompact, PS, G1; недостающие пулы fallback в 0 чтобы суммирование не схлопывалось до пустого вектора). Heap >90 длительно или GC >5 = риск OOM/деградации throughput.\n\nДля per-run dbt-* SparkApplication-ов серия видна только пока driver жив (≈30–60с) — нормальный «всплеск» каждый DAG-run. Тренды смотри по long-running bronze-* приложениям.\n\nNB: select `{__name__=~\".+_time_Value\"}` + rate() приводит к invalid vector (rate() strips __name__ → пулы Copy и MarkSweepCompact становятся идентичными labelset-ами и aggregator падает с \"vector cannot contain metrics with the same labelset\"). Поэтому каждый пул считаем отдельным rate() и суммируем явно.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -610,7 +610,7 @@
     {
       "type": "row",
       "id": 250,
-      "title": "Spark deep dive (open if investigating)",
+      "title": "Spark deep dive",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -622,8 +622,8 @@
         {
           "type": "timeseries",
           "id": 251,
-          "title": "Latency — batch (ms) + Hudi commit p95 (s)",
-          "description": "DURATION. Левая ось: Spark micro-batch latency. Правая ось: Hudi commit/deltacommit p95. Скачок одной без другой подсказывает где затык.",
+          "title": "Streaming batch latency",
+          "description": "DURATION. Spark Structured Streaming micro-batch latency (`metrics_spark_driver_spark_streaming_*_latency_Value`).\n\n• Видна только для bronze-* (streaming SparkApplication-ы).\n• Для dbt-silver/gold/test-* (batch) серий нет — эти приложения не запускают streaming queries.\n\nNB: ранее панель также показывала Hudi commit p95, но Hudi native PROMETHEUS reporter глобально выключен (`hoodie.metrics.on=false` в `spark-jobs/hudi_utils.py`) из-за несовместимости hudi-bundle 1.1.1 с simpleclient_dropwizard. Серия Hudi-таймеров пустая by design — write-progress смотри в панели «Spark write activity».",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -633,11 +633,6 @@
               "expr": "max by (spark_app_name) ({__name__=~\"metrics_spark_driver_spark_streaming_.+_latency_Value\", spark_app_name=~\"$spark_app\"})",
               "refId": "A",
               "legendFormat": "batch ms · {{spark_app_name}}"
-            },
-            {
-              "expr": "max by (spark_app_name, __name__) ({__name__=~\"hudi_.+_(commit|deltacommit|clustering)_timer\", quantile=\"0.95\", spark_app_name=~\"$spark_app\"}) / 1e9",
-              "refId": "B",
-              "legendFormat": "hudi p95 s · {{spark_app_name}} / {{__name__}}"
             }
           ],
           "fieldConfig": {
@@ -645,26 +640,6 @@
               "unit": "ms"
             },
             "overrides": [
-              {
-                "matcher": {
-                  "id": "byRegexp",
-                  "options": "hudi p95.*"
-                },
-                "properties": [
-                  {
-                    "id": "unit",
-                    "value": "s"
-                  },
-                  {
-                    "id": "custom.axisPlacement",
-                    "value": "right"
-                  },
-                  {
-                    "id": "custom.axisLabel",
-                    "value": "Hudi commit p95 (s)"
-                  }
-                ]
-              },
               {
                 "matcher": {
                   "id": "byRegexp",
@@ -707,8 +682,8 @@
         {
           "type": "timeseries",
           "id": 252,
-          "title": "Live executors (running pods)",
-          "description": "Количество Running executor-pod-ов в namespace spark-jobs, сгруппированных по spark_app_name. Лейбл извлекается из имени pod через label_replace (kube-state-metrics не экспортирует кастомные pod labels по умолчанию). Падение до 0 при активном streaming = драйвер потерял executors.",
+          "title": "Live executors",
+          "description": "Количество Running executor-pod-ов в namespace spark-jobs, сгруппированных по spark_app_name. Лейбл извлекается из имени pod через label_replace по паттерну Spark Operator-а: `<sparkapp-name>-<launch-hash>-exec-<id>` (kube-state-metrics не экспортирует кастомные pod labels по умолчанию).\n\nЕдиный паттерн матчит и bronze-* (streaming, стабильные executor-сеты), и dbt-* (per-run, executors поднимаются и убиваются вместе с driver-ом). Для dbt-силвер/голд серия видна только во время run-а и нормально опускается до 0 после завершения. Для bronze-* падение до 0 при активном streaming = инцидент (driver потерял executors).",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -718,11 +693,6 @@
               "refId": "A",
               "legendFormat": "{{spark_app_name}}",
               "expr": "count by (spark_app_name) (label_replace(kube_pod_status_phase{namespace=\"spark-jobs\", phase=\"Running\", pod=~\".+-[a-f0-9]{16}-exec-.+\"} == 1, \"spark_app_name\", \"$1\", \"pod\", \"(.+)-[a-f0-9]{16}-exec-.+\"))"
-            },
-            {
-              "refId": "B",
-              "legendFormat": "{{spark_app_name}}",
-              "expr": "count by (spark_app_name) (label_replace(kube_pod_status_phase{namespace=\"spark-jobs\", phase=\"Running\", pod=~\"spark-thrift-exec-.+\"} == 1, \"spark_app_name\", \"spark-thrift-server\", \"pod\", \".*\"))"
             }
           ],
           "fieldConfig": {
@@ -758,8 +728,8 @@
         {
           "type": "timeseries",
           "id": 253,
-          "title": "Spark write activity (jobs/min, failed stages)",
-          "description": "Spark DAGScheduler write activity: jobs/min (rate allJobs) + кумулятивные failed stages. Источник наблюдаемости write-пути для Hudi таблиц (нативный Hudi PROMETHEUS reporter выключен из-за несовместимости bundle 1.1.1 со стандартным simpleclient_dropwizard — см. lab08/OBSERVABILITY_PLAN.md → Known issues). DAGScheduler метрики публикуются Spark-нативно через PrometheusServlet на порту 4040. Растущий jobs/min = streaming активно коммитит micro-batches; failedStages > 0 — стейджи падают.",
+          "title": "Spark jobs & failed stages",
+          "description": "Spark DAGScheduler write activity: jobs/min (rate allJobs) + кумулятивные failed stages. Нативные метрики DAGScheduler публикуются Spark-ом через PrometheusServlet на порту 4040 — единый источник для всех SparkApplication-ов (bronze streaming + per-run dbt batch).\n\n• Bronze: непрерывный jobs/min при активном streaming, должен быть >0.\n• Silver / Gold: короткие пики во время dbt-runs (driver живёт ~30–60с), вне run-ов серия отсутствует.\n• failedStages > 0 — стейджи падают (cumulative counter, не сбрасывается до конца жизни driver-а).\n\nИсточник наблюдаемости write-пути для Hudi таблиц: нативный Hudi PROMETHEUS reporter выключен из-за несовместимости bundle 1.1.1 со стандартным simpleclient_dropwizard — см. lab08/OBSERVABILITY_PLAN.md → Known issues.",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -847,7 +817,7 @@
     {
       "type": "row",
       "id": 300,
-      "title": "Airflow  ($layer · $dag / $task)  —  RED",
+      "title": "Airflow",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -860,7 +830,7 @@
     {
       "type": "timeseries",
       "id": 20,
-      "title": "Throughput — tasks queued / running",
+      "title": "Tasks queued / running",
       "description": "RATE/SATURATION. queued стабильно растёт при стабильном running = шедулер не успевает раздавать. queued ~0 при высоком running = здоровая утилизация.",
       "datasource": {
         "type": "prometheus",
@@ -910,7 +880,7 @@
     {
       "type": "timeseries",
       "id": 21,
-      "title": "Duration — task duration (ms)",
+      "title": "Task duration",
       "description": "DURATION. airflow_task_duration с лейблами dag/task. Фильтруется $dag/$task (которые в свою очередь подчинены $layer / $layer_task). Растущий тренд = деградация.",
       "datasource": {
         "type": "prometheus",
@@ -956,7 +926,7 @@
     {
       "type": "timeseries",
       "id": 22,
-      "title": "Errors — task failures rate (5m)",
+      "title": "Task failures (rate 5m)",
       "description": "ERRORS. rate(airflow_ti_failures[5m]) с фильтром по $layer_task. >0 устойчиво = регулярные падения. Эти события также отрисованы аннотациями (красные вертикали) на остальных панелях для корреляции.",
       "datasource": {
         "type": "prometheus",
@@ -1006,7 +976,7 @@
     {
       "type": "row",
       "id": 350,
-      "title": "Airflow deep dive (open if investigating)",
+      "title": "Airflow deep dive",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -1018,7 +988,7 @@
         {
           "type": "timeseries",
           "id": 351,
-          "title": "DAG run duration (success)",
+          "title": "DAG run duration",
           "description": "airflow_dagrun_duration_success — длительность успешных запусков.",
           "datasource": {
             "type": "prometheus",
@@ -1121,7 +1091,7 @@
     {
       "type": "row",
       "id": 400,
-      "title": "MinIO  ($bucket)  —  RED",
+      "title": "MinIO",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1134,7 +1104,7 @@
     {
       "type": "timeseries",
       "id": 30,
-      "title": "S3 RED — req/s (left) + errors/s (right, red)",
+      "title": "S3 requests & errors",
       "description": "RATE + ERRORS. Левая ось: rate(minio_s3_requests_total) by api. Правая ось: rate(minio_s3_requests_errors_total) красным. Когда errors появляются на фоне трафика — видно сразу.",
       "datasource": {
         "type": "prometheus",
@@ -1226,7 +1196,7 @@
     {
       "type": "timeseries",
       "id": 31,
-      "title": "Duration — S3 TTFB p99 by api",
+      "title": "S3 TTFB p99 by API",
       "description": "DURATION. p99 time-to-first-byte по типу S3-операции. Растущий p99 при стабильном req/s = деградация хранилища.\n\nNB: MinIO экспортирует non-standard histogram `minio_s3_requests_ttfb_seconds_distribution` (без суффикса `_bucket`), при этом в lowercase-вариантах api отсутствует bucket le=\"+Inf\" → стандартный histogram_quantile возвращает NaN. Синтезируем +Inf из значения le=\"10.000\" через label_replace (предполагаем что нет операций > 10s — для лабы валидно). Capitalized api-серии (только le=+Inf, summary-style) фильтруем `api=~\"[a-z].*\"`. Дедуп double-scrape (job=minio + job=lab08-hl от headless service) через `job=\"minio\"`.",
       "datasource": {
         "type": "prometheus",
@@ -1272,7 +1242,7 @@
     {
       "type": "row",
       "id": 450,
-      "title": "MinIO deep dive (open if investigating)",
+      "title": "MinIO deep dive",
       "collapsed": true,
       "gridPos": {
         "h": 1,

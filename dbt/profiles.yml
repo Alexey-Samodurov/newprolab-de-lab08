@@ -3,12 +3,9 @@ lab08:
   outputs:
     dev:
       type: spark
-      method: thrift
-      host: spark-thrift-server.spark-jobs.svc.cluster.local
-      port: 10000
-      user: dbt
+      method: session
+      # `host` обязателен валидатором dbt-spark base credentials,
+      # для method=session значение игнорируется.
+      host: NA
       schema: silver
       threads: 2
-      connect_retries: 5
-      connect_timeout: 60
-      retry_all: true

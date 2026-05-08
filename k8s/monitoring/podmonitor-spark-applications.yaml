@@ -9,7 +9,8 @@
 # в /metrics/prometheus/ (PrometheusServlet aggregates executor sources).
 #
 # Лейбл `sparkoperator.k8s.io/app-name` относейблится в `spark_app_name` —
-# единый ключ для дашборда (фильтр $spark_app покрывает и Thrift, и SparkApps).
+# единый ключ для дашборда (фильтр $spark_app покрывает все SparkApplication-ы:
+# streaming bronze-* + dbt-* через SparkKubernetesOperator).
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
@@ -34,9 +35,3 @@ spec:
           targetLabel: spark_app_name
         - sourceLabels: [__meta_kubernetes_pod_label_spark_role]
           targetLabel: spark_role
-    # NB: Hudi native PROMETHEUS reporter (port 9091) намеренно НЕ скрейпим —
-    # в Hudi 1.1.1 он несовместим со стандартным simpleclient_dropwizard
-    # из Maven Central (NoSuchMethodError на shaded MetricRegistry). Hudi-метрики
-    # выключены в spark-jobs/hudi_utils.py; наблюдаемость держим на Spark
-    # DAGScheduler-метриках, экспортируемых тем же 4040/PrometheusServlet.
-    # См. lab08/OBSERVABILITY_PLAN.md → Known issues.

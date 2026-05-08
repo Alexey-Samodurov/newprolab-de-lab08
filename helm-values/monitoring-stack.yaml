@@ -10,7 +10,7 @@
 #   - Прочие компоненты (kubeApiServer, kubeControllerManager, etcd, scheduler) ОТКЛЮЧЕНЫ —
 #     в kind/Docker Desktop они или недоступны, или генерируют шум
 #
-# ServiceMonitor/PodMonitor для наших источников (spark-operator, sparkapps, thrift,
+# ServiceMonitor/PodMonitor для наших источников (spark-operator, sparkapps,
 # minio, airflow-statsd) — кладутся отдельными манифестами в k8s/monitoring/.
 # Чтобы Prometheus их подхватил, отключаем фильтрацию по releaseLabel.
 
