@@ -159,12 +159,12 @@ make streaming-apps
 
 | Таблица | Источник | Темп прихода | PK |
 |---|---|---|---|
-| `bronze.transactions` | S3 streaming (file source, JSONL) | ~10 мин слот | `composite_pk` = `transaction_id\|created_at\|user_id` |
-| `bronze.cancellations` | S3 streaming | 1 раз в день | `cancellation_id` |
-| `bronze.exchange_rates` | S3 streaming | 2-3 раза в день | `update_id` |
-| `bronze.users` | S3 streaming (reference) | snapshot | `user_id` |
-| `bronze.test_users` | S3 streaming (reference) | snapshot | `test_user_uuid` |
-| `bronze.promo_codes` | S3 streaming (reference) | snapshot | `promo_code_id` |
+| `bronze.transactions` | S3 streaming (file source, JSONL) — публичный YC бакет `npl-de18-lab8-data` | ~10 мин слот | `composite_pk` = `transaction_id\|created_at\|user_id` |
+| `bronze.cancellations` | S3 streaming — `npl-de18-lab8-data/cancellations/` | 1 раз в день | `cancellation_id` |
+| `bronze.exchange_rates` | S3 streaming — `npl-de18-lab8-data/exchange_rates/` (партиции `day=`) | 2-3 раза в день | `update_id` |
+| `bronze.users` | S3 streaming (reference, MinIO seed: `s3a://lake/raw/reference/`) | snapshot | `user_id` |
+| `bronze.test_users` | S3 streaming (reference, MinIO seed) | snapshot | `test_user_uuid` |
+| `bronze.promo_codes` | S3 streaming (reference, MinIO seed) | snapshot | `promo_code_id` |
 | `bronze.events_kafka` | Kafka streaming | real-time | `composite_pk` |
 
 Все bronze-таблицы наполняются **через Hudi upsert**, поэтому корректно отрабатывают
@@ -292,7 +292,7 @@ lab08/
 │       └── transactions_pipeline.py   # единственный DAG: sensor + dbt silver/gold/test
 ├── superset/
 │   └── init_dashboards.py       # bootstrap script: создаёт charts/dashboard через API
-└── sample/                      # sample данные от организаторов
+└── sample/                      # sample данные от организаторов (используются для seed-reference и offline-режима через seed-sample)
 ```
 
 ---

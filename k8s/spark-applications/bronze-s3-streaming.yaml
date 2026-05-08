@@ -5,11 +5,19 @@
 # Чекпойнты живут на s3a://hudi/.checkpoints/bronze-s3-stream/* — рестарт
 # SparkApplication (restartPolicy: Always) не теряет offset.
 #
-# Источники raw-данных:
-#   * lab / local: s3a://lake/raw  ← заполняется `make seed-data` в локальный MinIO
-#   * production:  s3a://npl-lab08 ← публичный Yandex Object Storage; для него
-#       нужно вернуть per-bucket override на endpoint storage.yandexcloud.net
-#       и сменить argument ниже.
+# Источники raw-данных (production-дефолт = публичный YC бакет):
+#   * transactions   : s3a://npl-de18-lab8-data/                  (day=*/slot=*/transactions.jsonl)
+#   * cancellations  : s3a://npl-de18-lab8-data/cancellations/    (day=*/cancellations.jsonl)
+#   * exchange_rates : s3a://npl-de18-lab8-data/exchange_rates/   (day=*/rates.jsonl)
+#   * reference      : s3a://lake/raw/reference/                  (MinIO seed — публичный
+#       бакет пока пуст в reference/, заливается через `make seed-reference`).
+#
+# Per-bucket Hadoop override (см. sparkConf ниже) разводит s3a:
+#   * `npl-de18-lab8-data` → https://storage.yandexcloud.net + Anonymous creds
+#   * остальные (lake/hudi/warehouse) → in-cluster MinIO + env creds
+#
+# Для локальной разработки (всё из MinIO) переопределить arguments на
+# s3a://lake/raw/{batch,cancellations,exchange_rates,reference} + ckpt-suffix.
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
@@ -22,9 +30,15 @@ spec:
   image: lab08/spark:3.5.8-hudi-1.1.1
   imagePullPolicy: IfNotPresent
   mainApplicationFile: "local:///opt/spark/jobs/bronze_s3_streaming.py"
+  # Чекпойнт-префикс bronze-s3-stream-yc — отдельный от исторического
+  # bronze-s3-stream (MinIO seed): file source хранит (path,mtime), смешивать
+  # offset'ы между разными источниками нельзя. При откате на MinIO — менять обратно.
   arguments:
-    - "s3a://lake/raw"
-    - "s3a://hudi/.checkpoints/bronze-s3-stream"
+    - "--transactions-path=s3a://npl-de18-lab8-data/"
+    - "--cancellations-path=s3a://npl-de18-lab8-data/cancellations/"
+    - "--rates-path=s3a://npl-de18-lab8-data/exchange_rates/"
+    - "--reference-path=s3a://lake/raw/reference/"
+    - "--ckpt-root=s3a://hudi/.checkpoints/bronze-s3-stream-yc"
   # hudi_utils.py — общий хелпер; явно объявляем чтобы Spark разложил его в sys.path
   # и driver/executor увидели импорт `from hudi_utils import ...`.
   deps:
@@ -53,6 +67,14 @@ spec:
     # которые подставляются driver/executor через envSecretKeyRefs ниже.
     # Никаких хардкоженных ключей в манифесте.
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    # Per-bucket override для публичного Yandex Object Storage. s3a поддерживает
+    # `fs.s3a.bucket.<name>.*` — настройки применяются ТОЛЬКО для этого бакета,
+    # не ломая дефолтный MinIO-таргет (lake/hudi/warehouse).
+    # AnonymousAWSCredentialsProvider — бакет публичный, ключи не нужны.
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.endpoint": "https://storage.yandexcloud.net"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.path.style.access": "true"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.connection.ssl.enabled": "true"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider": "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
     "spark.sql.streaming.numRecentProgressUpdates": "20"

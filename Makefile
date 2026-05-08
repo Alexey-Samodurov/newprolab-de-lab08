@@ -1,7 +1,7 @@
 .PHONY: help check up down ns secrets diff status spark-image hms \
         spark-code dbt-configmap airflow-dags airflow-trigger-pipeline superset-init \
         ingress hosts images airflow-image hms-image rbac airflow-unpause wait-airflow ensure-buckets verify-trino \
-        bootstrap-pipeline seed-data streaming-apps kafka-streaming-app \
+        bootstrap-pipeline seed-data seed-reference seed-sample streaming-apps kafka-streaming-app \
         monitoring monitoring-dashboards
 
 KIND_CONTEXT ?= docker-desktop
@@ -82,7 +82,7 @@ up: ns secrets images
 	helmfile --quiet -l name=minio-operator sync
 	helmfile --quiet -l name=minio-tenant sync
 	$(MAKE) ensure-buckets
-	$(MAKE) seed-data
+	$(MAKE) seed-reference
 	$(MAKE) airflow-dags
 	@echo ">>> [2/3] Остальная инфраструктура (helmfile sync)..."
 	helmfile --quiet sync
@@ -158,44 +158,72 @@ ensure-buckets:
 	    kubectl -n storage exec $$MINIO_POD -c minio -- sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin123 >/dev/null 2>&1 && mc mb --ignore-existing local/$$b 2>&1 | grep -v 'already exists'" || true; \
 	  done
 
-# Заливает sample/*.jsonl в s3://lake/raw/ согласно структуре, которую читает
-# spark-jobs/bronze_s3_streaming.py (long-running file-source streaming):
-#   batch/day={d}/slot=00/transactions.jsonl       (за дни из SEED_DAYS; стрим ловит по transactions.jsonl)
+# `seed-reference`  : льёт ТОЛЬКО reference/{users,test_users,promo_codes}.jsonl в
+#                     s3://lake/raw/reference/. Нужен в production-пайплайне,
+#                     потому что публичный YC бакет `npl-de18-lab8-data` пока
+#                     не содержит `reference/` — bronze-стрим читает справочники
+#                     из MinIO. Запускается из `make up`.
+# `seed-sample`     : льёт sample-транзакции / отмены / курсы в s3://lake/raw/...
+#                     для локальной разработки БЕЗ публичного бакета. Если
+#                     bronze-стрим переключить arguments на s3a://lake/raw — он
+#                     заработает оффлайн. По умолчанию НЕ запускается из `make up`.
+# `seed-data`       : alias = seed-reference + seed-sample (исторический контракт).
+#
+# Раскладка совпадает с тем, что читает spark-jobs/bronze_s3_streaming.py:
+#   batch/day={d}/slot=00/transactions.jsonl       (за дни из SEED_DAYS)
 #   cancellations/day={d}/cancellations.jsonl
-#   exchange_rates/rates.jsonl                      (flat; стрим ловит по rates.jsonl)
-#   reference/{users,test_users,promo_codes}.jsonl  (стрим разводит handle_reference по basename)
+#   exchange_rates/rates.jsonl                      (flat — для оффлайн-режима)
+#   reference/{users,test_users,promo_codes}.jsonl
 # Идемпотентно: --overwrite. Дни берутся из аргумента (по умолчанию 2025-10-06,2025-10-07).
 # NB: повторный seed с теми же ключами не гарантированно реобрабатывается file source —
-# для полного reset удалить s3://hudi/.checkpoints/bronze-s3-stream/* и bronze-таблицы.
+# для полного reset удалить s3://hudi/.checkpoints/bronze-s3-stream*/* и bronze-таблицы.
 SEED_DAYS ?= 2025-10-06 2025-10-07
-seed-data:
-	@echo ">>> Загружаю sample-данные в s3://lake/raw/..."
-	@kubectl -n data-platform delete pod mc-seed --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl -n data-platform run mc-seed \
+
+seed-data: seed-reference seed-sample
+
+seed-reference:
+	@echo ">>> Загружаю reference-справочники в s3://lake/raw/reference/..."
+	@kubectl -n data-platform delete pod mc-seed-ref --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@kubectl -n data-platform run mc-seed-ref \
 	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
 	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
 	  --command -- sh -c 'sleep 600' >/dev/null
-	@kubectl -n data-platform wait --for=condition=Ready pod/mc-seed --timeout=60s >/dev/null
+	@kubectl -n data-platform wait --for=condition=Ready pod/mc-seed-ref --timeout=60s >/dev/null
+	@kubectl -n data-platform exec -i mc-seed-ref -- sh -c 'cat > /tmp/users.jsonl' < $(SAMPLE_DIR)/users.jsonl
+	@kubectl -n data-platform exec -i mc-seed-ref -- sh -c 'cat > /tmp/test_users.jsonl' < $(SAMPLE_DIR)/test_users.jsonl
+	@kubectl -n data-platform exec -i mc-seed-ref -- sh -c 'cat > /tmp/promo_codes.jsonl' < $(SAMPLE_DIR)/promo_codes.jsonl
+	@kubectl -n data-platform exec mc-seed-ref -- sh -c '\
+	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
+	  mc cp --quiet /tmp/users.jsonl       m/lake/raw/reference/users.jsonl && \
+	  mc cp --quiet /tmp/test_users.jsonl  m/lake/raw/reference/test_users.jsonl && \
+	  mc cp --quiet /tmp/promo_codes.jsonl m/lake/raw/reference/promo_codes.jsonl && \
+	  echo "    s3://lake/raw/reference: $$(mc ls --recursive m/lake/raw/reference | wc -l) файлов"'
+	@kubectl -n data-platform delete pod mc-seed-ref --wait=false >/dev/null 2>&1 || true
+
+# Опциональный seed sample-транзакций для локальной разработки без публичного
+# бакета. Использовать вместе с переопределением arguments bronze-streaming.
+seed-sample:
+	@echo ">>> Загружаю sample транзакций / отмен / курсов в s3://lake/raw/..."
+	@kubectl -n data-platform delete pod mc-seed-sample --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@kubectl -n data-platform run mc-seed-sample \
+	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
+	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
+	  --command -- sh -c 'sleep 600' >/dev/null
+	@kubectl -n data-platform wait --for=condition=Ready pod/mc-seed-sample --timeout=60s >/dev/null
 	@for d in $(SEED_DAYS); do \
-	  kubectl -n data-platform exec -i mc-seed -- sh -c "cat > /tmp/transactions-$$d.jsonl" < $(SAMPLE_DIR)/transactions_sample.jsonl; \
-	  kubectl -n data-platform exec -i mc-seed -- sh -c "cat > /tmp/cancellations-$$d.jsonl" < $(SAMPLE_DIR)/cancellations_sample.jsonl; \
+	  kubectl -n data-platform exec -i mc-seed-sample -- sh -c "cat > /tmp/transactions-$$d.jsonl" < $(SAMPLE_DIR)/transactions_sample.jsonl; \
+	  kubectl -n data-platform exec -i mc-seed-sample -- sh -c "cat > /tmp/cancellations-$$d.jsonl" < $(SAMPLE_DIR)/cancellations_sample.jsonl; \
 	done
-	@kubectl -n data-platform exec -i mc-seed -- sh -c 'cat > /tmp/rates.jsonl' < $(SAMPLE_DIR)/exchange_rates_sample.jsonl
-	@kubectl -n data-platform exec -i mc-seed -- sh -c 'cat > /tmp/users.jsonl' < $(SAMPLE_DIR)/users.jsonl
-	@kubectl -n data-platform exec -i mc-seed -- sh -c 'cat > /tmp/test_users.jsonl' < $(SAMPLE_DIR)/test_users.jsonl
-	@kubectl -n data-platform exec -i mc-seed -- sh -c 'cat > /tmp/promo_codes.jsonl' < $(SAMPLE_DIR)/promo_codes.jsonl
-	@kubectl -n data-platform exec mc-seed -- sh -c '\
+	@kubectl -n data-platform exec -i mc-seed-sample -- sh -c 'cat > /tmp/rates.jsonl' < $(SAMPLE_DIR)/exchange_rates_sample.jsonl
+	@kubectl -n data-platform exec mc-seed-sample -- sh -c '\
 	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
 	  for d in $(SEED_DAYS); do \
 	    mc cp --quiet /tmp/transactions-$$d.jsonl m/lake/raw/batch/day=$$d/slot=00/transactions.jsonl && \
 	    mc cp --quiet /tmp/cancellations-$$d.jsonl m/lake/raw/cancellations/day=$$d/cancellations.jsonl; \
 	  done && \
 	  mc cp --quiet /tmp/rates.jsonl       m/lake/raw/exchange_rates/rates.jsonl && \
-	  mc cp --quiet /tmp/users.jsonl       m/lake/raw/reference/users.jsonl && \
-	  mc cp --quiet /tmp/test_users.jsonl  m/lake/raw/reference/test_users.jsonl && \
-	  mc cp --quiet /tmp/promo_codes.jsonl m/lake/raw/reference/promo_codes.jsonl && \
 	  echo "    s3://lake/raw: $$(mc ls --recursive m/lake/raw | wc -l) файлов"'
-	@kubectl -n data-platform delete pod mc-seed --wait=false >/dev/null 2>&1 || true
+	@kubectl -n data-platform delete pod mc-seed-sample --wait=false >/dev/null 2>&1 || true
 
 diff:
 	helmfile diff

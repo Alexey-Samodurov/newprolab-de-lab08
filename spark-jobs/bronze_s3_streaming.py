@@ -14,8 +14,12 @@ Bronze ingest из публичного S3 как long-running Spark Structured 
   * exactly-once на уровне обработки файлов (Spark file source ведёт checkpoint на S3);
   * upsert по PK закрывает дубли и поздние перезаливки исходного файла;
   * driver/executor падает → restartPolicy: Always → стрим продолжает с offset из checkpoint.
+
+Источники задаются по отдельности через CLI-аргументы — фактическая раскладка
+публичного бакета `npl-de18-lab8-data` отличается от исторической (`batch/`,
+flat `exchange_rates/`), поэтому единого `src_root` уже недостаточно.
 """
-import sys
+import argparse
 from functools import partial
 
 from pyspark.sql import SparkSession, DataFrame, functions as F
@@ -124,7 +128,11 @@ def handle_cancellations(batch_df: DataFrame, batch_id: int) -> None:
     df = (batch_df
           .withColumn("cancelled_ts", F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm"))
           .withColumn("event_day", F.date_format("cancelled_ts", "yyyy-MM-dd"))
-          .withColumn("ingested_at", F.current_timestamp()))
+          .withColumn("ingested_at", F.current_timestamp())
+          # Multiple source files in the same micro-batch can carry the same
+          # cancellation_id. Since ingested_at is identical within a batch,
+          # Hudi's precombine cannot break the tie → deduplicate here first.
+          .dropDuplicates(["cancellation_id"]))
     write_hudi(df, hudi_opts(
         "cancellations", "bronze",
         pk="cancellation_id",
@@ -235,9 +243,24 @@ def start_file_stream(
     return query
 
 
+def parse_args() -> argparse.Namespace:
+    """CLI: каждый источник — свой путь, чтобы можно было миксовать YC S3 + MinIO.
+
+    Дефолты соответствуют production: tx/cancellations/rates читаются напрямую
+    из публичного `npl-de18-lab8-data`, а reference/ — из локального MinIO seed
+    (организаторы пока не выложили `reference/*.jsonl` в публичный бакет).
+    """
+    p = argparse.ArgumentParser()
+    p.add_argument("--transactions-path", default="s3a://npl-de18-lab8-data/")
+    p.add_argument("--cancellations-path", default="s3a://npl-de18-lab8-data/cancellations/")
+    p.add_argument("--rates-path", default="s3a://npl-de18-lab8-data/exchange_rates/")
+    p.add_argument("--reference-path", default="s3a://lake/raw/reference/")
+    p.add_argument("--ckpt-root", default="s3a://hudi/.checkpoints/bronze-s3-stream")
+    return p.parse_args()
+
+
 def main() -> None:
-    src_root = sys.argv[1] if len(sys.argv) > 1 else "s3a://lake/raw"
-    ckpt_root = sys.argv[2] if len(sys.argv) > 2 else "s3a://hudi/.checkpoints/bronze-s3-stream"
+    args = parse_args()
 
     spark = (SparkSession.builder
              .appName("bronze-s3-streaming")
@@ -248,35 +271,40 @@ def main() -> None:
     queries = [
         start_file_stream(
             spark, name="transactions",
-            path=f"{src_root}/batch",
+            path=args.transactions_path,
             schema=TX_SCHEMA,
+            # Транзакции лежат как `day=YYYY-MM-DD/slot=HH-MM/transactions.jsonl`
+            # в корне бакета — без префикса `batch/`. recursiveFileLookup=true
+            # обходит обе партиции day и slot.
             glob="transactions.jsonl",
             handler=handle_transactions,
-            checkpoint=f"{ckpt_root}/transactions",
+            checkpoint=f"{args.ckpt_root}/transactions",
         ),
         start_file_stream(
             spark, name="cancellations",
-            path=f"{src_root}/cancellations",
+            path=args.cancellations_path,
             schema=CANCEL_SCHEMA,
             glob="cancellations.jsonl",
             handler=handle_cancellations,
-            checkpoint=f"{ckpt_root}/cancellations",
+            checkpoint=f"{args.ckpt_root}/cancellations",
         ),
         start_file_stream(
             spark, name="rates",
-            path=f"{src_root}/exchange_rates",
+            path=args.rates_path,
             schema=RATES_SCHEMA,
+            # exchange_rates в публичном бакете партиционированы по day=,
+            # recursiveFileLookup=true собирает rates.jsonl из всех day=*/.
             glob="rates.jsonl",
             handler=handle_rates,
-            checkpoint=f"{ckpt_root}/rates",
+            checkpoint=f"{args.ckpt_root}/rates",
         ),
         start_file_stream(
             spark, name="reference",
-            path=f"{src_root}/reference",
+            path=args.reference_path,
             schema=REFERENCE_UNION_SCHEMA,  # union — streaming source требует явную схему
             glob="*.jsonl",
-            handler=partial(handle_reference, spark, src_root),
-            checkpoint=f"{ckpt_root}/reference",
+            handler=partial(handle_reference, spark, args.reference_path),
+            checkpoint=f"{args.ckpt_root}/reference",
             trigger_seconds=300,  # справочники меняются редко
             include_source_path=True,
         ),
