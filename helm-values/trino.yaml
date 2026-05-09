@@ -1,6 +1,3 @@
-# Trino — read-only query engine поверх Hudi через HMS catalog.
-# Требуется версия >=470 для поддержки Hudi 1.x LSM timeline.
-# https://github.com/trinodb/charts
 image:
   tag: "476"
 
@@ -12,7 +9,6 @@ server:
       maxMemoryPerNode: 768MB
   exchangeManager:
     name: filesystem
-  # Разрешаем обработку X-Forwarded-For от ingress-nginx
   coordinatorExtraConfig: |
     http-server.process-forwarded=true
   workerExtraConfig: |

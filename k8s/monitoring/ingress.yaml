@@ -1,5 +1,4 @@
 ---
-# Grafana — единая точка входа observability lab08.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -22,7 +21,6 @@ spec:
                 port:
                   number: 80
 ---
-# Prometheus UI — для дебага PromQL.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

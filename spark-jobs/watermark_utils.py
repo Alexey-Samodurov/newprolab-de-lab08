@@ -22,6 +22,17 @@ _WATERMARK_DB = "bronze"
 
 
 def _watermark_hudi_opts() -> dict:
+    """
+    Generates and returns options for configuring Hudi with watermark-specific settings.
+
+    This function constructs a dictionary of Hudi options tailored for the watermark
+    table, including settings for primary key, precombine field, and column statistics.
+    Additional options specific to concurrency, locking, and cleaning policies are
+    also included.
+
+    Returns:
+        dict: A dictionary containing the Hudi configuration options.
+    """
     opts = hudi_opts(
         _WATERMARK_TABLE, _WATERMARK_DB,
         pk="watermark_id",
@@ -42,12 +53,26 @@ def _watermark_hudi_opts() -> dict:
 
 
 def extract_source_partitions_from_column(batch_df: DataFrame, column: str) -> list[str]:
-    """Достаём distinct event-day из колонки batch'а.
+    """
+    Extract unique partition values from a specified column in a DataFrame.
 
-    Ожидается, что колонка содержит ISO-дату `YYYY-MM-DD`. Префикс `day=`
-    добавляется здесь для совместимости с историческими source-day ключами.
-    Если колонки нет (не-day-partitioned поток вроде rates) — возвращаем
-    sentinel `__nonpartitioned__`.
+    This function processes a given DataFrame column, identifies unique non-null
+    values, and formats them as partition strings in the form of `day=value`.
+    If the column does not exist or contains only null values, it defaults
+    to returning a single-element list with `__nonpartitioned__`.
+
+    Parameters:
+    column : str
+        The name of the column to extract partition values from.
+
+    batch_df : DataFrame
+        The input DataFrame to process for partition extraction.
+
+    Returns:
+    list[str]
+        A sorted list of partition strings derived from the specified column.
+        If the column is not present in the DataFrame or no partitions are
+        found, a default value of `["__nonpartitioned__"]` is returned.
     """
     if column not in batch_df.columns:
         return ["__nonpartitioned__"]
@@ -68,11 +93,23 @@ def write_watermark(
     rows_in_batch: int,
     batch_id: int,
 ) -> None:
-    """Записать watermark-строки. Контракт см. в doc-string модуля.
+    """
+    Writes watermark information for processed partitions into a target table using Apache Hudi.
 
-    Вызывается ПОСЛЕ успешного `write_hudi(target, ...)`. Если основная
-    запись упадёт — watermark не появится, sensor продолжит ждать.
-    Семантика upsert по `watermark_id` гарантирует idempotent-ность.
+    This function constructs watermark records for the given table and list of partitions,
+    then writes them to the corresponding destination using a standardized schema. Each
+    watermark record contains details such as the table name, source partition, number
+    of rows in the batch, and the committed timestamp.
+
+    Parameters:
+        spark (SparkSession): Spark session used to create DataFrames and perform write operations.
+        table_name (str): Name of the target table for which the watermark is being written.
+        partitions (Iterable[str]): List of source partition identifiers to include in the watermark data.
+        rows_in_batch (int): Number of rows processed in the current batch.
+        batch_id (int): Unique identifier of the current batch being processed.
+
+    Returns:
+        None
     """
     parts = list(partitions)
     if not parts:
@@ -94,14 +131,20 @@ def write_watermark(
 
 
 def bootstrap_watermark_table(spark: SparkSession) -> None:
-    """Создать `bronze.ingest_watermarks`, если её ещё нет (idempotent).
+    """
+    Ensures the initialization of the watermark table.
 
-    Гарантирует, что:
-      1. Hive schema `bronze` существует — иначе Trino падает с
-         `SCHEMA_NOT_FOUND` ещё до того, как первая Hudi-таблица создаст
-         её лениво.
-      2. Сама таблица `ingest_watermarks` существует — sentinel-write
-         через Hudi регистрирует её в HMS.
+    This function creates the schema for the watermark table if it does not
+    already exist, and inserts an initial sentinel record to bootstrap the
+    watermark tracking system. It guarantees that the bronze.ingest_watermarks
+    table is in place for further usage.
+
+    Arguments:
+        spark: A SparkSession instance used to execute SQL commands and create
+        the initial DataFrame.
+
+    Returns:
+        None
     """
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_WATERMARK_DB}")
     sentinel = spark.createDataFrame(

@@ -1,13 +1,4 @@
 ---
-# MinIO Tenant: 3 встроенных prometheus-эндпоинта на порту 9000.
-# Нужен MINIO_PROMETHEUS_AUTH_TYPE=public (включён в helm-values/minio-tenant.yaml).
-#
-# Источники:
-#   /minio/v2/metrics/cluster   — cluster-wide: capacity, drives, requests, errors
-#   /minio/v2/metrics/node      — per-node: cpu, memory, network, fd
-#   /minio/v2/metrics/bucket    — per-bucket: usage, requests
-#
-# Service `minio` в namespace storage уже создан minio-operator-ом (ClusterIP, port 80→9000).
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -23,7 +14,7 @@ spec:
     matchLabels:
       v1.min.io/tenant: lab08
   endpoints:
-    - port: http-minio        # имя порта Service `minio` от minio-operator (port 80 → 9000)
+    - port: http-minio
       path: /minio/v2/metrics/cluster
       interval: 30s
       scheme: http

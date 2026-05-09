@@ -13,13 +13,10 @@ ARG MAVEN_BASE=https://repo1.maven.org/maven2
 WORKDIR /opt/spark/jars
 
 RUN set -eux; \
-    # Hudi
     curl -fsSLO "${MAVEN_BASE}/org/apache/hudi/hudi-spark3.5-bundle_2.12/${HUDI_VERSION}/hudi-spark3.5-bundle_2.12-${HUDI_VERSION}.jar"; \
     curl -fsSLO "${MAVEN_BASE}/org/apache/hudi/hudi-utilities-bundle_2.12/${HUDI_VERSION}/hudi-utilities-bundle_2.12-${HUDI_VERSION}.jar"; \
-    # S3a
     curl -fsSLO "${MAVEN_BASE}/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar"; \
     curl -fsSLO "${MAVEN_BASE}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"; \
-    # Kafka
     curl -fsSLO "${MAVEN_BASE}/org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_VERSION}.jar"; \
     curl -fsSLO "${MAVEN_BASE}/org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_VERSION}.jar"; \
     curl -fsSLO "${MAVEN_BASE}/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar"; \

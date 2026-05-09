@@ -1,16 +1,4 @@
 ---
-# Универсальный PodMonitor для всех SparkApplication-ов, поднятых Spark Operator-ом.
-# Подхватывает любые приложения автоматически — не нужно править манифест при
-# добавлении новой SparkApp. Селектор по двум lab-нейтральным лейблам:
-#   * sparkoperator.k8s.io/launched-by-spark-operator=true — ставит сам оператор
-#   * spark-role=driver                                    — ставит сам Spark
-#
-# Executor-pod-ы НЕ скрейпятся: их метрики Spark уже публикует через driver
-# в /metrics/prometheus/ (PrometheusServlet aggregates executor sources).
-#
-# Лейбл `sparkoperator.k8s.io/app-name` относейблится в `spark_app_name` —
-# единый ключ для дашборда (фильтр $spark_app покрывает все SparkApplication-ы:
-# streaming bronze-* + dbt-* через SparkKubernetesOperator).
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
@@ -27,7 +15,7 @@ spec:
       sparkoperator.k8s.io/launched-by-spark-operator: "true"
       spark-role: driver
   podMetricsEndpoints:
-    - port: spark-ui      # порт 4040 — определён Spark Operator-ом по умолчанию для driver-pod
+    - port: spark-ui
       path: /metrics/prometheus/
       interval: 30s
       relabelings:

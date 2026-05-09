@@ -1,11 +1,8 @@
-# ingress-nginx controller для Docker Desktop / kind.
-# Docker Desktop автоматически проксирует LoadBalancer сервисы на localhost.
-# https://kubernetes.github.io/ingress-nginx/deploy/#docker-desktop
 controller:
   hostPort:
     enabled: false
   service:
-    type: LoadBalancer  # Docker Desktop назначает external IP = localhost → порт 80 доступен напрямую
+    type: LoadBalancer
   tolerations:
     - key: node-role.kubernetes.io/control-plane
       operator: Exists

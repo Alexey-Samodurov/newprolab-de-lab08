@@ -1,11 +1,3 @@
-# Декларативная инсталляция всей инфраструктуры lab08.
-# Использование:
-#   helmfile sync          - первичная установка / синхронизация всех релизов
-#   helmfile -l name=trino sync   - выборочно по релизу
-#   helmfile destroy       - снести всё
-#
-# Порядок установки управляется через `needs` (helmfile сам строит DAG).
-
 repositories:
   - name: minio-operator
     url: https://operator.min.io
@@ -25,7 +17,6 @@ repositories:
     url: https://prometheus-community.github.io/helm-charts
 
 releases:
-  # ==== Ingress ====
   - name: ingress-nginx
     namespace: ingress-nginx
     chart: ingress-nginx/ingress-nginx
@@ -33,7 +24,6 @@ releases:
     createNamespace: true
     values:
       - helm-values/ingress-nginx.yaml
-  # ==== Storage ====
   - name: minio-operator
     namespace: minio-operator
     chart: minio-operator/operator
@@ -49,9 +39,6 @@ releases:
     values:
       - helm-values/minio-tenant.yaml
 
-  # ==== Catalog ====
-  # Postgres backend для Hive Metastore. Сам HMS — k8s manifest (k8s/hive-metastore.yaml),
-  # применяется через `make hms` после установки чартов.
   - name: hive-metastore-postgres
     namespace: data-platform
     chart: bitnami/postgresql
@@ -59,14 +46,10 @@ releases:
     values:
       - helm-values/hms-postgres.yaml
 
-  # ==== Compute / Orchestration ====
   - name: spark-operator
     namespace: data-platform
     chart: spark-operator/spark-operator
     version: "1.4.6"
-    # Webhook cert (data-platform/spark-operator-webhook-certs) генерируется helm hook'ом при первой установке,
-    # после чего его field-manager — `spark-operator` (k8s job), а не `helm`. На повторном sync helm SSA
-    # падает с conflicts. Pre-sync удаляем чтобы upgrade перевыдал свежий.
     hooks:
       - events: ["presync"]
         showlogs: true
@@ -84,18 +67,17 @@ releases:
   - name: airflow
     namespace: data-platform
     chart: apache-airflow/airflow
-    version: "1.15.0"  # app v2.10.x
+    version: "1.15.0"
     needs:
       - data-platform/spark-operator
       - ingress-nginx/ingress-nginx
     values:
       - helm-values/airflow.yaml
 
-  # ==== Query / BI ====
   - name: trino
     namespace: data-platform
     chart: trino/trino
-    version: "0.34.0"  # app >= 470
+    version: "0.34.0"
     needs:
       - data-platform/hive-metastore-postgres
     values:
@@ -111,20 +93,16 @@ releases:
     values:
       - helm-values/superset.yaml
 
-  # ==== Observability ====
-  # kube-prometheus-stack: Prometheus Operator + Prometheus + Grafana + Alertmanager + kube-state-metrics.
-  # ServiceMonitor/PodMonitor для наших источников лежат в k8s/monitoring/ (применяются `make monitoring`).
   - name: kube-prometheus-stack
     namespace: monitoring
     chart: prometheus-community/kube-prometheus-stack
-    version: "65.5.1"   # app v0.78 (Prometheus 2.55, Grafana 11.3)
+    version: "65.5.1"
     createNamespace: true
     needs:
       - ingress-nginx/ingress-nginx
     values:
       - helm-values/monitoring-stack.yaml
 
-  # statsd → prometheus конвертер для Airflow метрик.
   - name: prometheus-statsd-exporter
     namespace: monitoring
     chart: prometheus-community/prometheus-statsd-exporter

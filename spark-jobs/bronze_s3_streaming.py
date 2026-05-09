@@ -7,6 +7,11 @@ from pyspark.sql.types import (
 )
 
 from hudi_utils import hudi_opts, write_hudi
+from watermark_utils import (
+    bootstrap_watermark_table,
+    extract_source_partitions_from_column,
+    write_watermark as _write_watermark_rows,
+)
 
 
 TX_SCHEMA = StructType([
@@ -36,14 +41,19 @@ RATES_SCHEMA = StructType([
     StructField("rate_tgrk_rub", DoubleType(), True),
 ])
 
-from watermark_utils import (
-    bootstrap_watermark_table,
-    extract_source_partitions_from_column,
-    write_watermark as _write_watermark_rows,
-)
-
 
 def handle_transactions(spark: SparkSession, batch_df: DataFrame, batch_id: int) -> None:
+    """Process a micro-batch of transaction events and write to Hudi.
+
+    Enriches each row with a composite primary key, event_day partition, and
+    ingested_at timestamp, then upserts into the bronze transactions Hudi table
+    and records a watermark entry.
+
+    Args:
+        spark: Active SparkSession.
+        batch_df: DataFrame containing raw transaction records for this batch.
+        batch_id: Unique micro-batch identifier assigned by Structured Streaming.
+    """
     if batch_df.rdd.isEmpty():
         print(f"[tx batch={batch_id}] empty")
         return
@@ -75,6 +85,17 @@ def handle_transactions(spark: SparkSession, batch_df: DataFrame, batch_id: int)
 
 
 def handle_cancellations(spark: SparkSession, batch_df: DataFrame, batch_id: int) -> None:
+    """Process a micro-batch of cancellation events and write to Hudi.
+
+    Parses the cancelled_at timestamp, derives event_day, deduplicates by
+    cancellation_id, and upserts into the bronze cancellations Hudi table using a
+    global index. Records a watermark entry after the write.
+
+    Args:
+        spark: Active SparkSession.
+        batch_df: DataFrame containing raw cancellation records for this batch.
+        batch_id: Unique micro-batch identifier assigned by Structured Streaming.
+    """
     if batch_df.rdd.isEmpty():
         print(f"[cancel batch={batch_id}] empty")
         return
@@ -103,6 +124,16 @@ def handle_cancellations(spark: SparkSession, batch_df: DataFrame, batch_id: int
 
 
 def handle_rates(spark: SparkSession, batch_df: DataFrame, batch_id: int) -> None:
+    """Process a micro-batch of exchange rate events and write to Hudi.
+
+    Adds an ingested_at timestamp and upserts into the bronze exchange_rates
+    non-partitioned Hudi table, then records a watermark entry.
+
+    Args:
+        spark: Active SparkSession.
+        batch_df: DataFrame containing raw exchange rate records for this batch.
+        batch_id: Unique micro-batch identifier assigned by Structured Streaming.
+    """
     if batch_df.rdd.isEmpty():
         print(f"[rates batch={batch_id}] empty")
         return
@@ -137,6 +168,26 @@ def start_file_stream(
     max_files_per_trigger: int = 20,
     max_file_age: str = "7d",
 ):
+    """Start a JSON file-based Structured Streaming query.
+
+    Configures a readStream with glob filtering and file age limits, then launches
+    a writeStream with the given foreachBatch handler and checkpoint location.
+
+    Args:
+        spark: Active SparkSession.
+        name: Query name used in Spark UI and logs.
+        path: S3a source path to read JSON files from.
+        schema: Optional StructType to enforce on the JSON source.
+        glob: Glob pattern passed to pathGlobFilter (e.g. ``"transactions.jsonl"``).
+        handler: Callable ``(batch_df, batch_id)`` invoked for each micro-batch.
+        checkpoint: S3a path for streaming checkpoint storage.
+        trigger_seconds: Processing trigger interval in seconds.
+        max_files_per_trigger: Maximum number of files to process per trigger.
+        max_file_age: Maximum age of files to include (e.g. ``"7d"``).
+
+    Returns:
+        StreamingQuery: The running streaming query object.
+    """
     reader = (spark.readStream
               .format("json")
               .option("pathGlobFilter", glob)
@@ -160,10 +211,14 @@ def start_file_stream(
 
 
 def parse_args() -> argparse.Namespace:
-    """CLI: каждый источник — свой путь.
+    """Parse CLI arguments for S3 source paths and checkpoint root.
 
-    transactions / cancellations / rates читаются напрямую из публичного
-    YC бакета `npl-de18-lab8-data`. Reference вынесен в bronze_reference_batch.py.
+    Each source (transactions, cancellations, rates) is read directly from
+    the public YC bucket ``npl-de18-lab8-data``. Reference data is handled
+    separately in ``bronze_reference_batch.py``.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with source paths and checkpoint root.
     """
     p = argparse.ArgumentParser()
     p.add_argument("--transactions-path", default="s3a://npl-de18-lab8-data/")
@@ -174,6 +229,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Bootstrap the watermark table and start all three S3 file streams.
+
+    Parses CLI arguments, creates a SparkSession, ensures the watermark table
+    exists, and launches streaming queries for transactions, cancellations, and
+    exchange rates. Blocks until any query terminates.
+    """
     args = parse_args()
 
     spark = (SparkSession.builder

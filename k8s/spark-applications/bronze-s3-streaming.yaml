@@ -45,9 +45,6 @@ spec:
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider": "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
-    # 16 партиций для shuffle стадий — у нас типичный micro-batch это
-    # 50–500k rows, 200 (default) генерит overhead на task scheduling и
-    # мелкие parquet'ы. 16 совпадает с hudi.upsert/insert.shuffle.parallelism.
     "spark.sql.shuffle.partitions": "16"
     "spark.sql.streaming.numRecentProgressUpdates": "20"
     "spark.dynamicAllocation.enabled": "true"

@@ -1,5 +1,3 @@
-# Spark Operator (kubeflow). Watches SparkApplication CRD across namespaces.
-# https://github.com/kubeflow/spark-operator/tree/master/charts/spark-operator-chart
 spark:
   jobNamespaces:
     - spark-jobs
@@ -11,8 +9,6 @@ webhook:
 controller:
   workers: 5
 
-# Включаем встроенный prometheus-эндпоинт оператора (контроллер reconcile-метрики,
-# webhook latency, queue depth). Скрейпится через ServiceMonitor в k8s/monitoring/.
 metrics:
   enable: true
   port: 8080
@@ -27,4 +23,3 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-# RBAC создаётся автоматически для jobNamespaces

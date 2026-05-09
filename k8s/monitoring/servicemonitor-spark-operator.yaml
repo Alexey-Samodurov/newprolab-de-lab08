@@ -1,6 +1,4 @@
 ---
-# Скрейп встроенных метрик Spark Operator (controller reconcile, webhook).
-# Endpoint включается в helm-values/spark-operator.yaml (metrics.enable=true).
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

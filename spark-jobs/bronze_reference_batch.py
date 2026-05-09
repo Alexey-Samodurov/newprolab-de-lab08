@@ -52,7 +52,31 @@ def overwrite_reference(
     pk: str,
     batch_id: int,
 ) -> int:
-    """Перезаписать одну reference-таблицу. Возвращает число строк."""
+    """
+    Overwrite reference data by reading a JSON file, adding an ingestion timestamp, writing to Hudi,
+    and updating a watermark.
+
+    This function processes snapshot data for a specified table by reading it from a JSON file
+    into a DataFrame with the provided schema. It enriches the data by adding a timestamp column
+    indicating the ingestion time. If there are no rows in the snapshot, the operation is skipped.
+    Otherwise, it writes the enriched data to a Hudi dataset with the specified table options,
+    and updates the watermark metadata for tracking purposes.
+
+    Arguments:
+        spark (SparkSession): The active Spark session to use for reading and writing the data.
+        src_root (str): The root directory for the source data.
+        fname (str): The name of the JSON file within the source root directory to process.
+        table (str): The name of the destination table for the reference data.
+        schema (StructType): The schema to enforce when reading the JSON file.
+        pk (str): The primary key column for the Hudi dataset.
+        batch_id (int): The ID of the current batch being processed.
+
+    Returns:
+        int: The number of rows successfully written to the destination.
+
+    Raises:
+        None
+    """
     path = f"{src_root.rstrip('/')}/{fname}"
     df = (
         spark.read.schema(schema).json(path)
@@ -77,6 +101,15 @@ def overwrite_reference(
 
 
 def main() -> int:
+    """Run the reference batch job: overwrite each configured reference table.
+
+    Parses CLI arguments, selects the tables to process (optionally filtered by
+    whitelist), creates a SparkSession, and calls overwrite_reference for each
+    table. In strict mode (default), any failure causes a non-zero exit code.
+
+    Returns:
+        0 on success, 1 if any table failed to load or if no tables matched the whitelist.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--reference-path", required=True,
@@ -123,9 +156,7 @@ def main() -> int:
                 spark, src_root=src_root, fname=fname, table=table,
                 schema=schema, pk=pk, batch_id=batch_id,
             )
-        except Exception as exc:  # noqa: BLE001
-            # PySparkValueError и Py4JJavaError часто дают пустой repr() —
-            # тащим полный traceback и нагрузку класса.
+        except Exception as exc:
             tb = traceback.format_exc()
             extra = ""
             for attr in ("error_class", "message_parameters", "errorClass", "getErrorClass"):
@@ -133,7 +164,7 @@ def main() -> int:
                 if callable(v):
                     try:
                         v = v()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         v = None
                 if v:
                     extra += f" {attr}={v!r}"

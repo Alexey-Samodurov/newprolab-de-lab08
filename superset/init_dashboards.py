@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Superset bootstrap: создаёт database connection, datasets, charts и дашборд
 "Lab08 — Transaction Analytics" через REST API.
@@ -44,11 +43,13 @@ from typing import Any
 import requests
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for Superset host, username, and password.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with host, user, and password fields.
+    """
     p = argparse.ArgumentParser(description="Superset bootstrap for Lab08")
     p.add_argument("--host", default="http://localhost:8088")
     p.add_argument("--user", default="admin")
@@ -56,17 +57,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Superset HTTP client
-# ---------------------------------------------------------------------------
 
 class SupersetClient:
     def __init__(self, host: str, user: str, password: str) -> None:
+        """Initialize SupersetClient and authenticate against the Superset API.
+
+        Args:
+            host: Base URL of the Superset instance (e.g. ``http://localhost:8088``).
+            user: Username for authentication.
+            password: Password for authentication.
+        """
         self.host = host.rstrip("/")
         self.session = requests.Session()
         self._login(user, password)
 
     def _login(self, user: str, password: str) -> None:
+        """Authenticate with Superset and store Bearer token and CSRF token in session headers.
+
+        Args:
+            user: Username for the Superset login endpoint.
+            password: Password for the Superset login endpoint.
+
+        Raises:
+            requests.HTTPError: If login or CSRF token request fails.
+        """
         resp = self.session.post(
             f"{self.host}/api/v1/security/login",
             json={"username": user, "password": password, "provider": "db", "refresh": True},
@@ -79,13 +93,36 @@ class SupersetClient:
         self.session.headers.update({"X-CSRFToken": csrf.json()["result"]})
 
     def _check(self, r: requests.Response) -> requests.Response:
+        """Raise for non-OK responses, printing a human-readable error to stderr.
+
+        Args:
+            r: HTTP response to check.
+
+        Returns:
+            requests.Response: The same response if it was OK.
+
+        Raises:
+            requests.HTTPError: If the response status indicates failure.
+        """
         if not r.ok:
             print(f"  ERROR {r.status_code} {r.request.method} {r.url}: {r.text[:400]}", file=sys.stderr)
             r.raise_for_status()
         return r
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        """HTTP с автоматическим retry на 429 (Superset rate limiter)."""
+        """Send an HTTP request with automatic retry on HTTP 429 (rate limit).
+
+        Retries up to 6 times with exponential backoff, honoring the
+        ``Retry-After`` header when present.
+
+        Args:
+            method: HTTP method (e.g. ``"GET"``, ``"POST"``).
+            path: API path relative to the host (e.g. ``"/api/v1/chart/"``).
+            **kwargs: Additional keyword arguments forwarded to ``requests.Session.request``.
+
+        Returns:
+            requests.Response: The response from the last attempt.
+        """
         url = f"{self.host}{path}"
         backoff = 1.0
         for attempt in range(6):
@@ -96,21 +133,63 @@ class SupersetClient:
             print(f"  429 rate-limited on {method} {path}; sleep {wait:.1f}s (attempt {attempt + 1}/6)")
             time.sleep(wait)
             backoff = min(backoff * 2, 16.0)
-        return r  # последняя попытка — отдадим как есть для _check
+        return r
 
     def get(self, path: str, **kwargs: Any) -> dict:
+        """Perform a GET request and return the parsed JSON response.
+
+        Args:
+            path: API path relative to the host.
+            **kwargs: Additional keyword arguments forwarded to the request.
+
+        Returns:
+            dict: Parsed JSON response body.
+        """
         return self._check(self._request("GET", path, **kwargs)).json()
 
     def post(self, path: str, payload: dict) -> dict:
+        """Perform a POST request with a JSON payload and return the parsed response.
+
+        Args:
+            path: API path relative to the host.
+            payload: Dictionary to serialize as JSON request body.
+
+        Returns:
+            dict: Parsed JSON response body.
+        """
         return self._check(self._request("POST", path, json=payload)).json()
 
     def put(self, path: str, payload: dict) -> dict:
+        """Perform a PUT request with a JSON payload and return the parsed response.
+
+        Args:
+            path: API path relative to the host.
+            payload: Dictionary to serialize as JSON request body.
+
+        Returns:
+            dict: Parsed JSON response body.
+        """
         return self._check(self._request("PUT", path, json=payload)).json()
 
     def delete(self, path: str) -> None:
+        """Perform a DELETE request and raise on failure.
+
+        Args:
+            path: API path relative to the host.
+        """
         self._check(self._request("DELETE", path))
 
     def find_id(self, path: str, name_field: str, name: str) -> int | None:
+        """Search for a Superset resource by name and return its ID.
+
+        Args:
+            path: API list endpoint path (e.g. ``"/api/v1/chart/"``).
+            name_field: Name of the filter column (e.g. ``"slice_name"``).
+            name: Value to match against name_field.
+
+        Returns:
+            int if a matching resource is found, None otherwise.
+        """
         r = self.session.get(
             f"{self.host}{path}",
             params={"q": json.dumps({"filters": [{"col": name_field, "opr": "eq", "value": name}]})},
@@ -120,13 +199,9 @@ class SupersetClient:
         return results[0]["id"] if results else None
 
 
-# ---------------------------------------------------------------------------
-# Database / datasets
-# ---------------------------------------------------------------------------
 
 GOLD_SCHEMA = "gold"
 
-# Какая колонка у каждого датасета является основной временной (для time-series viz).
 DATASET_MAIN_DTTM = {
     "transactions_by_hour": "event_day",
     "purchases_by_hour":    "event_day",
@@ -136,7 +211,6 @@ DATASET_MAIN_DTTM = {
     "user_cohorts":         "event_day",
     "promo_expired_usage_daily": "event_day",
     "dq_summary_daily":     "event_day",
-    # promo_codes_analysis — без time series (snapshot)
 }
 
 
@@ -180,9 +254,6 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
         print(f"  Created dataset '{GOLD_SCHEMA}.{table}' id={ds_id}")
         time.sleep(0.5)
 
-    # Проставим main_dttm_col, если задан и колонка существует.
-    # NB: в Superset 4.x колонки обновляются ТОЛЬКО через PUT /api/v1/dataset/{id}
-    # с полным массивом columns; отдельного /column/{id} endpoint нет.
     dttm = DATASET_MAIN_DTTM.get(table)
     if dttm:
         cols = client.get(f"/api/v1/dataset/{ds_id}").get("result", {}).get("columns", [])
@@ -190,7 +261,6 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
         if dttm in col_names:
             updated_cols = []
             for c in cols:
-                # Передаём только поля, которые принимает DatasetColumnsPutSchema.
                 col_payload = {
                     "id": c["id"],
                     "column_name": c["column_name"],
@@ -216,9 +286,6 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
     return ds_id
 
 
-# ---------------------------------------------------------------------------
-# Charts
-# ---------------------------------------------------------------------------
 
 def upsert_chart(client: SupersetClient, payload: dict) -> int | None:
     """Идемпотентный upsert: PUT по id если есть, иначе POST."""
@@ -227,8 +294,6 @@ def upsert_chart(client: SupersetClient, payload: dict) -> int | None:
         return None
     existing = client.find_id("/api/v1/chart/", "slice_name", payload["slice_name"])
     if existing:
-        # На update передаём только мутабельные поля. Менять datasource через PUT
-        # рискованно (Superset 4.x на это часто отвечает 500), а нам и не нужно.
         update_payload = {
             k: v for k, v in payload.items()
             if k in {"slice_name", "description", "viz_type", "params"}
@@ -248,9 +313,6 @@ def cleanup_obsolete_charts(client: SupersetClient) -> None:
         "Promo Codes: Over-Limit Uses",
         "Purchases by Hour (Share)",
         "KPI: Completed %",
-        # Старые имена до добавления русских подзаголовков через "—".
-        # Без удаления Superset держит их привязанными к дашборду и они
-        # вываливаются "unplaced" мимо табов в общую кучу.
         "Daily Revenue (TGRK)",
         "Daily Transactions by Status",
         "Transactions by Hour",
@@ -265,7 +327,6 @@ def cleanup_obsolete_charts(client: SupersetClient) -> None:
             print(f"  Removed obsolete chart '{stale}' (id={sid})")
 
 
-# Generic helpers for chart params -----------------------------------------
 
 def simple_metric(column: str, agg: str, label: str) -> dict:
     return {
@@ -298,15 +359,11 @@ def adhoc_filter(col: str, op: str, val: Any) -> dict:
 REAL_USERS_FILTER = adhoc_filter("is_test_user", "==", False)
 
 
-# ---------------------------------------------------------------------------
-# Charts — definitions
-# ---------------------------------------------------------------------------
 
 def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str, int | None]:
     """Возвращает словарь slice_name → chart_id."""
     charts: dict[str, int | None] = {}
 
-    # --- KPI row (Big Number) -------------------------------------------------
     charts["KPI: Total Revenue (TGRK)"] = upsert_chart(client, {
         "slice_name": "KPI: Total Revenue (TGRK)",
         "description": "Совокупная GROSS-выручка в TGRK по реальным пользователям (без вычета "
@@ -336,12 +393,6 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         }),
     })
 
-    # Раньше здесь был "KPI: Completed %" по transactions_by_hour, но синтетический
-    # генератор в этой лабе детерминированно выставляет ~90% completed (доля
-    # колеблется в пределах 89.9–90.2% по дням), поэтому метрика была бесполезна
-    # как KPI — никогда не «ловила» аномалию и не давала сигнала бизнесу.
-    # Заменили на Invalid Refund Rate: real DQ-метрика которая варьируется по
-    # дням и причинам, отражает целостность связки cancellations ↔ transactions.
     charts["KPI: Invalid Refund %"] = upsert_chart(client, {
         "slice_name": "KPI: Invalid Refund %",
         "description": "Доля отмен с поломанной refund-семантикой (is_refund_invalid=true: "
@@ -389,7 +440,6 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         }),
     })
 
-    # --- Trends ---------------------------------------------------------------
     charts["Daily Revenue (TGRK)"] = upsert_chart(client, {
         "slice_name": "Daily Revenue (TGRK) — выручка по дням, TGRK",
         "description": "Дневная GROSS-выручка в TGRK (без вычета refunds). Конвертация валют "
@@ -447,7 +497,6 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         }),
     })
 
-    # --- Operations -----------------------------------------------------------
     charts["Transactions by Hour"] = upsert_chart(client, {
         "slice_name": "Transactions by Hour — нагрузка по часам (test vs real)",
         "description": "Распределение транзакций по часам суток с разбивкой test vs real пользователи. "
@@ -519,7 +568,6 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         }),
     })
 
-    # --- Users & Promo --------------------------------------------------------
     charts["User Cohorts: New vs Returning"] = upsert_chart(client, {
         "slice_name": "User Cohorts — новые vs вернувшиеся по дням",
         "description": "Уникальные пользователи по дням, разбивка по когорте: "
@@ -575,9 +623,6 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
     return charts
 
 
-# ---------------------------------------------------------------------------
-# Dashboard layout (position_json + native filters)
-# ---------------------------------------------------------------------------
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:10]}"
@@ -725,7 +770,6 @@ def upsert_dashboard(
     charts_by_name: dict[str, int | None],
     ds: dict[str, int | None],
 ) -> int:
-    # Резолвим chart_id и метаданные (uuid).
     valid_charts: dict[str, int] = {n: cid for n, cid in charts_by_name.items() if cid is not None}
     chart_meta: dict[int, dict] = {}
     for name, cid in valid_charts.items():
@@ -735,7 +779,6 @@ def upsert_dashboard(
     def cid(name: str) -> int | None:
         return valid_charts.get(name)
 
-    # Layout: 3 таба.
     kpis = [n for n in [
         "KPI: Total Revenue (TGRK)",
         "KPI: Total Transactions",
@@ -782,7 +825,6 @@ def upsert_dashboard(
         },
     ]
 
-    # Чистим строки с дырами (если каких-то чартов нет — выкидываем None).
     for tab in tabs_spec:
         cleaned_rows = []
         for row in tab["rows"]:
@@ -793,8 +835,6 @@ def upsert_dashboard(
 
     position = build_position_json(tabs_spec, chart_meta)
 
-    # Scope фильтров: is_test_user применяем только к чартам на transactions_by_hour;
-    # Event day исключаем у чартов без временной колонки (Promo Codes).
     charts_with_test_user = [
         c for n, c in valid_charts.items()
         if n in {
@@ -834,9 +874,6 @@ def upsert_dashboard(
         dash_id = client.post("/api/v1/dashboard/", payload)["id"]
         print(f"  Created dashboard '{title}' id={dash_id}")
 
-    # Привязываем чарты к дашборду. Без этого frontend показывает в layout
-    # "There is no chart definition associated with this component".
-    # Делаем со sleep чтобы не упереться в Superset rate-limiter (429 на массовых PUT).
     for cid_ in valid_charts.values():
         client.put(f"/api/v1/chart/{cid_}", {"dashboards": [dash_id]})
         time.sleep(0.4)
@@ -844,9 +881,6 @@ def upsert_dashboard(
     return dash_id
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()

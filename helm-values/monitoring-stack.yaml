@@ -1,29 +1,12 @@
-# kube-prometheus-stack — единый блок observability lab08.
-# https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
-#
-# Что включено:
-#   - Prometheus (retention 1d, PVC 5Gi)
-#   - Grafana (admin/admin, sidecar для авто-импорта дашбордов из ConfigMap)
-#   - Alertmanager — поднимается, но без user-rules (по требованию)
-#   - kube-state-metrics — для общих кластерных метрик (Pod restarts и т.п.)
-#   - node-exporter ОТКЛЮЧЁН — лаб локальный, hardware-метрики не нужны
-#   - Прочие компоненты (kubeApiServer, kubeControllerManager, etcd, scheduler) ОТКЛЮЧЕНЫ —
-#     в kind/Docker Desktop они или недоступны, или генерируют шум
-#
-# ServiceMonitor/PodMonitor для наших источников (spark-operator, sparkapps,
-# minio, airflow-statsd) — кладутся отдельными манифестами в k8s/monitoring/.
-# Чтобы Prometheus их подхватил, отключаем фильтрацию по releaseLabel.
 
 fullnameOverride: kps
 
-# ── Prometheus ────────────────────────────────────────────────────────────────
 prometheus:
   prometheusSpec:
     retention: 1d
     retentionSize: "4GB"
     scrapeInterval: 30s
     evaluationInterval: 30s
-    # Подхватывать ВСЕ ServiceMonitor/PodMonitor в кластере (не только с label release=kps)
     serviceMonitorSelectorNilUsesHelmValues: false
     podMonitorSelectorNilUsesHelmValues: false
     ruleSelectorNilUsesHelmValues: false
@@ -43,11 +26,10 @@ prometheus:
         cpu: 500m
         memory: 1Gi
 
-# ── Grafana ───────────────────────────────────────────────────────────────────
 grafana:
   adminUser: admin
   adminPassword: admin
-  defaultDashboardsEnabled: true   # стандартные k8s/node дашборды — полезно как baseline
+  defaultDashboardsEnabled: true
   sidecar:
     dashboards:
       enabled: true
@@ -60,7 +42,7 @@ grafana:
     datasources:
       enabled: true
   persistence:
-    enabled: false   # дашборды доставляются как код через ConfigMap, persistence не нужен
+    enabled: false
   resources:
     requests:
       cpu: 50m
@@ -71,8 +53,6 @@ grafana:
   service:
     type: ClusterIP
 
-# ── Alertmanager ──────────────────────────────────────────────────────────────
-# Ставится в дефолте; алёртов не настраиваем — просто доступен на случай ad-hoc.
 alertmanager:
   enabled: true
   alertmanagerSpec:
@@ -85,7 +65,6 @@ alertmanager:
         cpu: 200m
         memory: 256Mi
 
-# ── Лишние компоненты выключаем ───────────────────────────────────────────────
 nodeExporter:
   enabled: false
 prometheus-node-exporter:
@@ -105,9 +84,8 @@ kubeEtcd:
   enabled: false
 
 defaultRules:
-  create: false   # дефолтные алёрты (CPUThrottlingHigh и т.п.) не создаём — алёрты вне scope
+  create: false
 
-# kube-state-metrics — оставляем дефолт; лёгкий, нужен для kube_pod_*, kube_deployment_* метрик
 kube-state-metrics:
   resources:
     requests:

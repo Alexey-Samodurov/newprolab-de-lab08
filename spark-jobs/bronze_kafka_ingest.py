@@ -1,5 +1,6 @@
 import sys
 import os
+from functools import partial
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 
@@ -35,6 +36,17 @@ EVENT_SCHEMA = StructType([
 
 
 def process_batch(spark, batch_df, batch_id):
+    """Process a single Kafka micro-batch, routing events to Hudi bronze tables.
+
+    Splits the batch by the ``_source`` field and writes transactions,
+    cancellations, and exchange-rate events to their respective Hudi tables,
+    then records watermark entries for each partition.
+
+    Args:
+        spark: Active SparkSession.
+        batch_df: DataFrame for the current micro-batch.
+        batch_id: Unique micro-batch identifier assigned by Structured Streaming.
+    """
     if batch_df.rdd.isEmpty():
         return
     batch_df.persist()
@@ -56,9 +68,6 @@ def process_batch(spark, batch_df, batch_id):
             precombine="ingested_at", table_suffix="_kafka",
             column_stats_cols="event_day,status,transaction_type,ingested_at",
         ))
-        # Watermark пишется по event_day (event-time), не по дате kafka_ts:
-        # DAG-сенсор фильтрует по event_day=ds в bronze.transactions, поэтому
-        # ключ watermark должен совпадать с тем, что dbt видит в данных.
         write_watermark(
             spark, "transactions",
             extract_source_partitions_from_column(tx, "event_day"),
@@ -110,6 +119,15 @@ def process_batch(spark, batch_df, batch_id):
 
 
 def main():
+    """Start the Kafka streaming ingest job and write parsed events to Hudi.
+
+    Reads Kafka bootstrap servers and topic from CLI args or environment variables,
+    parses JSON events against EVENT_SCHEMA, and routes each micro-batch through
+    process_batch to write bronze Hudi tables.
+
+    Raises:
+        RuntimeError: When KAFKA_BOOTSTRAP_SERVERS is not configured via argv or env.
+    """
     bootstrap = (sys.argv[1] if len(sys.argv) > 1
                  else os.environ.get("KAFKA_BOOTSTRAP_SERVERS"))
     topic = (sys.argv[2] if len(sys.argv) > 2
@@ -141,7 +159,6 @@ def main():
               .select(F.from_json("json", EVENT_SCHEMA).alias("e"), "kafka_ts", "kafka_offset")
               .select("e.*", "kafka_ts", "kafka_offset"))
 
-    from functools import partial
     query = (parsed.writeStream
              .foreachBatch(partial(process_batch, spark))
              .option("checkpointLocation", "s3a://checkpoints/bronze-kafka")

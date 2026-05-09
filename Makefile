@@ -55,31 +55,20 @@ secrets:
 	@test -f k8s/secrets.yaml || (echo "Создай k8s/secrets.yaml из k8s/secrets.example.yaml" && exit 1)
 	kubectl apply -f k8s/secrets.yaml >/dev/null
 
-# Собирает spark image только если его нет (идемпотентно).
 spark-image:
 	@docker image inspect lab08/spark:3.5.8-hudi-1.1.1 >/dev/null 2>&1 \
 	  || docker build -t lab08/spark:3.5.8-hudi-1.1.1 docker/spark/
 
-# Собирает airflow image только если его нет (идемпотентно).
 airflow-image:
 	@docker image inspect lab08/airflow:2.10.4 >/dev/null 2>&1 \
 	  || docker build -t lab08/airflow:2.10.4 docker/airflow/
 
-# Собирает hive-metastore image только если его нет (идемпотентно).
 hms-image:
 	@docker image inspect lab08/hive-metastore:3.0.0-pg2 >/dev/null 2>&1 \
 	  || docker build -t lab08/hive-metastore:3.0.0-pg2 docker/hive-metastore/
 
 images: spark-image airflow-image hms-image
 
-# === ОДНА КОМАНДА: полностью идемпотентная установка ===
-# 1. namespaces  2. secrets  3. images  4. helmfile sync (MinIO/HMS-pg/Spark-Op/Trino/Superset/Airflow/Ingress)
-# 5. HMS deployment  6. lake bucket  7. RBAC  8. configmaps (spark-code, dbt-project)  9. streaming SparkApps
-# 10. Ingress  11. DAG'и + unpause  12. verify Trino
-#
-# Spark Thrift Server убран — dbt теперь запускается как SparkApplication через
-# SparkKubernetesOperator (см. lab08/MIGRATION_THRIFT_TO_OPERATOR.md). BI-запросы
-# идут через Trino, ad-hoc — `kubectl exec deploy/trino-coordinator -- trino`.
 up: ns secrets images
 	@echo ">>> [1/3] MinIO (storage)..."
 	helmfile --quiet -l name=minio-operator sync
@@ -120,38 +109,16 @@ hms:
 	kubectl apply -f k8s/hive-metastore.yaml >/dev/null
 	kubectl -n data-platform rollout status deployment/hive-metastore --timeout=300s
 
-# RBAC для spark-jobs namespace и cross-ns доступа Airflow.
-# Сами Secrets применяются отдельным таргетом `make secrets` (см. k8s/secrets.example.yaml).
 rbac:
 	kubectl apply -f k8s/spark-rbac.yaml >/dev/null
 	kubectl apply -f k8s/airflow-rbac.yaml >/dev/null
 
-# Long-running streaming SparkApplications: bronze.* ingest из S3 (file source).
-# SparkApp декларативный (restartPolicy: Always + checkpoints на S3),
-# Airflow им не управляет — он живёт отдельно от orchestration слоя.
-# Идемпотентно: kubectl apply, повторный запуск не пересоздаёт running app.
-#
-# Reference (users / test_users / promo_codes) — отдельный one-shot
-# SparkApplication, см. lab08/ADR-002-reference-batch-split.md.
-# Применяется здесь же, т.к. логически часть bronze-bootstrap'а: пайплайн
-# silver/gold join'ится со справочниками. Идемпотентно: kubectl apply
-# на Completed SparkApplication ничего не пересоздаёт; для перезапуска
-# (если справочник реально обновили) — `make reference-batch`.
-#
-# NB: Kafka SparkApp применяется ОТДЕЛЬНО через `make kafka-streaming-app`,
-# т.к. внешний брокер (kafka.ijklmn.xyz:9092) недоступен в большинстве сред —
-# при включении он бы бесконечно рестартовал (см. ADR #24 в lab08/PLAN.md).
 streaming-apps:
 	@echo ">>> Применяю streaming SparkApplication (S3)..."
 	kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
 	@echo "    SparkApp applied. bronze.* появится через ~1-3 мин (cold start)."
 	@$(MAKE) reference-batch
 
-# Reference one-shot: после успеха остаётся в Completed, retry'и только
-# по сетевым сбоям до S3 (restartPolicy: OnFailure × 3). Чтобы пересобрать
-# bronze.users / test_users / promo_codes из обновлённого snapshot —
-# вызови `make reference-batch` повторно: target снесёт старый SparkApp
-# и создаст новый.
 reference-batch:
 	@echo ">>> Применяю bronze-reference-batch (one-shot)..."
 	-kubectl -n spark-jobs delete sparkapplication bronze-reference-batch --ignore-not-found --wait=true >/dev/null 2>&1
@@ -159,15 +126,11 @@ reference-batch:
 	@echo "    SparkApp applied. Дождись Completed:"
 	@echo "      kubectl -n spark-jobs get sparkapp bronze-reference-batch -w"
 
-# Kafka streaming SparkApp — применять только когда брокер реально доступен,
-# иначе бесконечный CrashLoopBackOff. См. ADR #24.
 kafka-streaming-app:
 	@echo ">>> Применяю bronze-kafka-ingest SparkApplication..."
 	@echo "    ВНИМАНИЕ: убедись, что Kafka-брокер из Secret lab08-credentials (KAFKA_BOOTSTRAP_SERVERS) доступен изнутри кластера."
 	kubectl apply -f k8s/spark-applications/bronze-kafka-ingest.yaml >/dev/null
 
-# На случай если MinIO Tenant уже создан без `lake` bucket — досоздаём через mc внутри pod'а.
-# Идемпотентно: mc mb игнорирует уже существующие buckets с --ignore-existing.
 ensure-buckets:
 	@echo ">>> Создаю/проверяю MinIO buckets..."
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12; do \
@@ -219,16 +182,11 @@ down:
 	@echo "  Для полной переустановки: make up"
 	@echo "================================================================"
 
-# Пересоздаёт ConfigMap spark-jobs-code из spark-jobs/*.py.
-# spark-jobs/ — единственный источник правды для PySpark скриптов.
 spark-code:
 	kubectl create configmap spark-jobs-code -n spark-jobs \
 	  --from-file=spark-jobs/ \
 	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Пересоздаёт ConfigMap dbt-project из dbt/ (flat layout, имена префиксированы слоем).
-# Airflow KubernetesPodOperator читает этот configmap; dbt-init.sh раскладывает
-# flat-структуру в нормальную dbt-проектную раскладку.
 dbt-configmap:
 	kubectl create configmap dbt-project -n spark-jobs \
 	  --from-file=dbt_project.yml=dbt/dbt_project.yml \
@@ -256,14 +214,10 @@ dbt-configmap:
 	  --from-file=test_recon_cancellations_orphan_rate.sql=dbt/tests/recon_cancellations_orphan_rate.sql \
 	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Применяет Ingress ресурсы для всех UI-сервисов (nginx-ingress должен быть запущен).
 ingress:
 	kubectl apply -f k8s/ingress.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/ingress.yaml >/dev/null
 
-# Observability: ServiceMonitor / PodMonitor + Grafana dashboards.
-# kube-prometheus-stack уже поднят helmfile-ом; здесь — наша конфигурация скрейпа
-# и набор дашбордов lab08. Идемпотентно: kubectl apply.
 monitoring: monitoring-dashboards
 	kubectl apply -f k8s/monitoring/namespace.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/servicemonitor-spark-operator.yaml >/dev/null
@@ -271,9 +225,6 @@ monitoring: monitoring-dashboards
 	kubectl apply -f k8s/monitoring/servicemonitor-minio.yaml >/dev/null
 	@echo ">>> Monitoring objects applied. Grafana → http://grafana.lab08.local (admin/admin)."
 
-# ConfigMap с дашбордами Grafana — sidecar grafana подхватывает любые ConfigMap
-# с label grafana_dashboard=1 в любом namespace и публикует JSON в Grafana.
-# Идемпотентно: dry-run | apply.
 monitoring-dashboards:
 	kubectl apply -f k8s/monitoring/namespace.yaml >/dev/null
 	kubectl -n monitoring create configmap grafana-dashboard-lab08-overview \
@@ -285,8 +236,6 @@ monitoring-dashboards:
 	    grafana_folder=lab08 | \
 	  kubectl apply -f - >/dev/null
 
-# Добавляет *.lab08.local в /etc/hosts (требует sudo).
-# Идемпотентен: не дублирует строки при повторном запуске.
 hosts:
 	@for host in airflow.lab08.local superset.lab08.local trino.lab08.local s3.lab08.local grafana.lab08.local prometheus.lab08.local; do \
 	  grep -q "$$host" /etc/hosts || echo "127.0.0.1 $$host" | sudo tee -a /etc/hosts; \
@@ -299,12 +248,6 @@ hosts:
 	@echo "  http://grafana.lab08.local    — Grafana (admin/admin)"
 	@echo "  http://prometheus.lab08.local — Prometheus"
 
-# Загружает DAG-файлы в MinIO bucket s3://artifacts/dags/.
-# В make up вызывается ДО helmfile sync для Airflow → initContainer dag-init подхватит
-# свежий снимок при первом старте pod-а.
-# При повторном вызове (после изменения файлов) sidecar dag-sync синкнет за ≤15 сек,
-# scheduler пересканирует папку за ≤30 сек (DAG_DIR_LIST_INTERVAL).
-# Идемпотентно: --overwrite + --remove синхронизирует состояние с локальной копией.
 airflow-dags:
 	@echo ">>> Загружаю DAG-файлы в s3://artifacts/dags/..."
 	@kubectl -n data-platform delete pod mc-dag-uploader --ignore-not-found --wait=true >/dev/null 2>&1 || true
@@ -325,8 +268,6 @@ airflow-dags:
 	  echo "    s3://artifacts/dags: $$(mc ls --recursive minio/artifacts/dags | wc -l) файлов"'
 	@kubectl -n data-platform delete pod mc-dag-uploader --wait=false >/dev/null 2>&1 || true
 
-# Снимает с паузы DAG'и проекта. Идемпотентно: повторный вызов — no-op.
-# Ждём пока DAG'и появятся в БД (после parse), потом unpause.
 airflow-unpause:
 	$(eval SCHEDULER_POD := $(shell kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'))
 	@for d in transactions_pipeline; do \
@@ -340,7 +281,6 @@ airflow-unpause:
 	  done; \
 	done
 
-# Проверяет что Trino отвечает и каталог hudi работает.
 verify-trino:
 	@echo ">>> Проверка Trino..."
 	@kubectl -n data-platform wait --for=condition=ready pod -l app.kubernetes.io/name=trino,app.kubernetes.io/component=coordinator --timeout=180s >/dev/null
@@ -355,23 +295,10 @@ verify-trino:
 	    echo "    bronze.transactions ещё не создана (создастся после первого micro-batch)"; \
 	  fi
 
-# Запускает основной DAG вручную (bronze ждётся sensor'ом внутри DAG'а).
 airflow-trigger-pipeline:
 	$(eval SCHEDULER_POD := $(shell kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'))
 	kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags trigger transactions_pipeline
 
-# Bootstrap: гарантирует, что lab08 пройден end-to-end к моменту superset-init.
-#   1) если gold уже наполнен → skip (любой success-run наполнил витрины);
-#   2) если scheduler уже создал run (queued/running) → НЕ триггерим вручную,
-#      иначе получаем 2 параллельных run'а (manual + scheduled), которые
-#      max_active_runs=1 сериализует → пайплайн крутится дважды;
-#   3) иначе триггерим manual run за прошлый день (cold-start).
-#   4) ждём ПЕРВЫЙ успешный DAGRun (любой execution_date) — после него
-#      gold уже содержит данные за тот day и Superset можно поднимать.
-#      ВАЖНО: с catchup=True scheduler создаёт ~30 DAGRun-ов на месячную
-#      историю и max_active_runs=1 гонит их последовательно. Ждать success
-#      САМОГО свежего execution_date неправильно — это часы. Дашборд
-#      работает с любого первого успеха.
 bootstrap-pipeline:
 	@set -e; \
 	SCHEDULER_POD=$$(kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'); \
@@ -418,10 +345,6 @@ bootstrap-pipeline:
 	done; \
 	echo "ERR: ни один DAGRun не завершился успешно за 25 мин — посмотри SparkApplication bronze-s3-streaming, DAG transactions_pipeline"; exit 1
 
-# Инициализирует Superset: создаёт database connection (Trino), datasets, charts и dashboard.
-# Выполняется ВНУТРИ кластера: скрипт копируется в superset pod и запускается там
-# с in-cluster URL http://localhost:8088 — никакого port-forward не требуется.
-# Идемпотентно: повторный запуск пропускает уже существующие сущности.
 superset-init:
 	$(eval SUPERSET_POD := $(shell kubectl -n data-platform get pod -l app=superset,release=superset -o jsonpath='{.items[0].metadata.name}'))
 	@test -n "$(SUPERSET_POD)" || (echo "Superset pod не найден" && exit 1)
@@ -432,17 +355,6 @@ superset-init:
 	@echo ">>> Запускаю инициализацию (REST API на localhost:8088 внутри пода)..."
 	kubectl -n data-platform exec $(SUPERSET_POD) -c superset -- python /tmp/init_dashboards.py --host http://localhost:8088
 
-# Одноразовая очистка cross-partition дублей в bronze.cancellations и
-# silver.cancellations_clean. После того как `bronze_s3_streaming.py` перешёл
-# на GLOBAL_BLOOM index, новые upsert-ы дедуплицируются корректно, но УЖЕ
-# накопленные дубли (~13051 строк) не пропадут сами — Hudi global-index
-# решает дубль только когда ключ ещё раз приходит со стороны источника.
-# Самый чистый путь — снести таблицы и checkpoint cancellations-стрима;
-# при следующем тике стрим заново пройдёт по S3 и наполнит таблицу с нуля,
-# уже без дублей. После этого нужно прогнать silver с --full-refresh.
-#
-# ВАЖНО: таргет НЕ трогает transactions/rates/reference — у них своя логика
-# и их данные не повреждены.
 reset-cancellations:
 	@echo ">>> 1/3 Удаляю Hive table bronze.cancellations и silver.cancellations_clean..."
 	@kubectl -n data-platform exec deploy/trino-coordinator -- \
@@ -471,12 +383,6 @@ reset-cancellations:
 	@echo "      2) Прогони silver с full-refresh: dbt run --select cancellations_clean --full-refresh"
 	@echo "         (или дождись следующего DAG-run'а — incremental сам пересоздаст пустую таблицу)."
 
-# Сбрасывает bronze.ingest_watermarks при corrupted Hudi timeline.
-# Симптом: HoodieRollbackException "Found commits after time, please rollback greater commits first".
-# Причина: multi-writer ситуация при сбое — inflight + completed коммиты вперемешку.
-# bronze.ingest_watermarks — производная таблица: после сброса первый успешный
-# foreachBatch / bootstrap её пересоздаст. Потеря данных — только история watermark'ов
-# (sensor увидит партицию заново при следующем коммите).
 reset-watermarks:
 	@echo ">>> 1/3 Удаляю Hive table bronze.ingest_watermarks..."
 	@kubectl -n data-platform exec deploy/trino-coordinator -- \

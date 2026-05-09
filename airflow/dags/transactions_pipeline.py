@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from airflow import DAG
+from airflow.operators.python import ShortCircuitOperator
 from airflow.providers.cncf.kubernetes.operators.spark_kubernetes import SparkKubernetesOperator
 from airflow.sensors.python import PythonSensor
 
@@ -24,17 +25,10 @@ SPARK_CONF: dict[str, str] = {
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider",
     "spark.kubernetes.namespace": NAMESPACE,
     "spark.kubernetes.executor.deleteOnTermination": "true",
-    # 16 партиций для shuffle (dedup-window cancellations_clean, joins в gold).
-    # default=200 → overhead на task scheduling и россыпь мелких parquet-ов;
-    # совпадает с hudi.upsert/insert.shuffle.parallelism в hudi_utils.
     "spark.sql.shuffle.partitions": "16",
-    # AQE + coalesce — динамически схлопывает skew-партиции и убирает
-    # пустые после фильтров → меньше пиковая память на executor'е.
     "spark.sql.adaptive.enabled": "true",
     "spark.sql.adaptive.coalescePartitions.enabled": "true",
     "spark.sql.adaptive.skewJoin.enabled": "true",
-    # Promo_codes / users — крошечные справочники, broadcast вместо
-    # shuffle-hash join. 32MB порог покрывает наши reference-таблицы.
     "spark.sql.autoBroadcastJoinThreshold": str(32 * 1024 * 1024),
     "spark.metrics.namespace": "spark",
     "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet",
@@ -84,10 +78,21 @@ VOLUMES: list[dict] = [
 
 
 def _build_dbt_spec(step: str, dbt_args: list[str]) -> dict:
-    """SparkApplication-манифест для конкретного dbt-шага.
+    """
+    Builds a specification dictionary for a DBT SparkApplication.
 
-    `step` ∈ {silver, gold, test}. Имя CR-а суффиксуется Jinja-шаблоном
-    `ts_nodash` — даёт уникальность per task instance.
+    This function constructs a dictionary representing the specification for a
+    SparkApplication to be executed with DBT. It defines various configuration
+    details for the Spark job, including the API version, application type,
+    pythonVersion, execution mode, image specifications, Spark configurations,
+    and Kubernetes-specific attributes like metadata and volume mounts.
+
+    Parameters:
+        step (str): A string representing the current DBT step to be executed.
+        dbt_args (list[str]): A list of arguments to be passed to the DBT job.
+
+    Returns:
+        dict: A dictionary that defines the configuration for the SparkApplication.
     """
     return {
         "apiVersion": "sparkoperator.k8s.io/v1beta2",
@@ -115,6 +120,25 @@ def _build_dbt_spec(step: str, dbt_args: list[str]) -> dict:
 
 
 def make_dbt_spark_task(task_id: str, dbt_args: list[str]) -> SparkKubernetesOperator:
+    """
+    Creates a SparkKubernetesOperator task for executing dbt commands in a Kubernetes context.
+
+    This function facilitates the creation of Airflow tasks for running dbt-related operations
+    in a Spark environment leveraging Kubernetes. The task leverages a provided task identifier
+    and argument list to dynamically set up Kubernetes configurations for execution.
+
+    Parameters:
+    task_id: str
+        The unique identifier for the SparkKubernetesOperator task. It should typically
+        represent the dbt operation being performed.
+    dbt_args: list[str]
+        A list of arguments to be passed to the dbt command during execution. It includes
+        various dbt options and configurations.
+
+    Returns:
+    SparkKubernetesOperator
+        A configured SparkKubernetesOperator object ready to be scheduled within an Airflow DAG.
+    """
     step = task_id.replace("dbt_", "")
     return SparkKubernetesOperator(
         task_id=task_id,
@@ -131,14 +155,22 @@ def make_dbt_spark_task(task_id: str, dbt_args: list[str]) -> SparkKubernetesOpe
 
 
 def _trino_query_tolerant(sql: str):
-    """Выполнить Trino-запрос, проглатывая ошибки «схемы/таблицы ещё нет».
+    """
+    Executes a Trino SQL query with tolerance for specific exceptions, and swallows errors caused by
+    non-existent schemas, tables, or databases.
 
-    Стрим лениво создаёт `bronze.ingest_watermarks` при первом батче. До
-    этого момента любой `SELECT FROM hudi.bronze.ingest_watermarks` падает
-    с SCHEMA_NOT_FOUND или TABLE_NOT_FOUND. С точки зрения Airflow это
-    просто «данных пока нет», поэтому возвращаем пустой результат вместо
-    исключения. Любые другие ошибки пробрасываются — это настоящие
-    инциденты (Trino упал, права, синтаксис).
+    Parameters:
+    sql : str
+        The SQL query to be executed on the Trino database.
+
+    Returns:
+    list
+        The records retrieved from the query execution, or an empty list if a
+        tolerant exception occurs.
+
+    Raises:
+    Exception
+        Re-raises any exceptions not related to schema, table, or database not being found.
     """
     from airflow.providers.trino.hooks.trino import TrinoHook
 
@@ -146,8 +178,6 @@ def _trino_query_tolerant(sql: str):
     try:
         return TrinoHook(trino_conn_id="trino_default").get_records(sql)
     except Exception as exc:
-        # У TrinoUserError из trino-python-client есть атрибут `error_name`.
-        # Если его нет — фолбэк на подстроку в repr/str.
         name = getattr(exc, "error_name", None) or ""
         text = f"{type(exc).__name__}: {exc!r}"
         if name in _IGNORE or any(t in text for t in _IGNORE):
@@ -157,10 +187,19 @@ def _trino_query_tolerant(sql: str):
 
 
 def _bronze_watermark_ready(**context) -> bool:
-    """Sensor: появилась ли watermark-строка `transactions|day=<ds>`.
+    """
+    Determines if the bronze watermark is ready for a specific day.
 
-    Контракт см. в lab08/ADR-001-bronze-watermark-table.md (раздел
-    «Sensor semantics»). Сравнение строго `=`, не `>=`.
+    This function checks the existence of a record in the `hudi.bronze.ingest_watermarks`
+    table for a specified partition (day) and table name ('transactions'). It queries
+    the database using a tolerant Trino query mechanism.
+
+    Parameters:
+        context (dict): A dictionary containing runtime context information. Specifically,
+            'ds' key is expected to retrieve the target date string.
+
+    Returns:
+        bool: True if the record exists indicating readiness, False otherwise.
     """
     ds = context["ds"]
     rows = _trino_query_tolerant(
@@ -172,10 +211,20 @@ def _bronze_watermark_ready(**context) -> bool:
 
 
 def _partition_has_data(**context) -> bool:
-    """ShortCircuit: rows_in_batch>0 в watermark для day=<ds>.
+    """
+    Determines whether a partition has data based on the specified context.
 
-    Защита от edge-case: стрим обработал файл нулевого размера → watermark
-    есть, но в bronze.transactions ничего полезного нет → dbt бессмысленен.
+    This function queries the "hudi.bronze.ingest_watermarks" table to check
+    if any data rows exist for the specified source partition (day). The
+    presence of data is evaluated by inspecting the 'rows_in_batch' value.
+
+    Parameters:
+    context (Dict[str, Any]): A dictionary containing the execution context.
+                              It must include the key "ds" representing the
+                              source partition in 'day=YYYY-MM-DD' format.
+
+    Returns:
+    bool: True if the partition has data (rows_in_batch > 0), otherwise False.
     """
     ds = context["ds"]
     rows = _trino_query_tolerant(
@@ -201,18 +250,10 @@ with DAG(
     default_args={"owner": "lab08"},
     tags=["lab08", "hudi", "dbt"],
 ) as dag:
-    from airflow.operators.python import ShortCircuitOperator
-
     wait_bronze = PythonSensor(
         task_id="wait_bronze_ready",
         python_callable=_bronze_watermark_ready,
-        # Контракт см. в lab08/ADR-001-bronze-watermark-table.md.
-        # SCHEMA_NOT_FOUND/DATABASE_NOT_FOUND внутри callback трактуются
-        # как «строки ещё нет» — стрим bronze ещё не успел создать таблицу.
         poke_interval=30,
-        # 10 мин: покрывает штатный cold-start стрима + первый foreachBatch.
-        # Worker не блокируется (mode=reschedule). Пропуски источника
-        # (25/26 апр) уйдут в skipped через 10 мин — разовая плата.
         timeout=60 * 10,
         mode="reschedule",
         soft_fail=True,
