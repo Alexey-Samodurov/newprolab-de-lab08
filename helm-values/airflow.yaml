@@ -106,6 +106,16 @@ _dagsInitContainers: &dagsInitContainers
         value: /tmp/.mc
       - name: HOME
         value: /tmp
+    # mc mirror — это легковесный S3-list+download: 50m CPU / 64Mi RAM
+    # хватает с запасом, дефолтные 1 CPU / 1Gi из chart-а — оверкилл,
+    # особенно учитывая что initContainer запускается на КАЖДОМ worker-pod-е.
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
     command:
       - sh
       - -c
@@ -129,6 +139,14 @@ _dagsSyncSidecar: &dagsSyncSidecar
         value: /tmp/.mc
       - name: HOME
         value: /tmp
+    # Polling-цикл с sleep 15s — пиково жрёт <100m CPU и ~80Mi RSS.
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
     command:
       - sh
       - -c
@@ -190,7 +208,21 @@ triggerer:
   extraContainers: *dagsSyncSidecar
 
 # Worker pod (KubernetesExecutor) — только initContainer, sidecar не нужен (task runs once).
+# Один worker pod = одна Airflow-task. Все наши таски тонкие:
+#   * SparkKubernetesOperator      — submit + watch SparkApplication CR (REST вызовы);
+#   * SqlSensor / PythonOperator   — пара Trino-запросов через requests/trino-client.
+# Тяжёлая работа происходит в Spark driver/executor pod-ах, к worker-у это
+# не относится. Дефолт chart-а 1 CPU / 1Gi оверкилл — worker'ов запускается
+# по числу running tasks, лимиты транслируются в k8s requests и съедают
+# квоту докер-десктопного кластера.
 workers:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
   extraVolumes: *dagsExtraVolumes
   extraVolumeMounts: *dagsExtraVolumeMounts
   extraInitContainers: *dagsInitContainers
