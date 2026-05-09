@@ -1,6 +1,3 @@
-# Hive Metastore standalone (на базе bitsondatadev/hive-metastore, Hive 3.0).
-# Backend — postgres из bitnami chart (см. helmfile.yaml).
-# Образ уже содержит postgres JDBC driver.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -57,7 +54,7 @@ data:
       </property>
       <property>
         <name>metastore.warehouse.dir</name>
-        <value>s3a://warehouse/</value>
+        <value>s3a://lake/warehouse/</value>
       </property>
     </configuration>
 ---
@@ -86,9 +83,6 @@ spec:
             - name: thrift
               containerPort: 9083
           envFrom:
-            # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY → читаются hadoop-aws через
-            # EnvironmentVariableCredentialsProvider (см. metastore-site.xml).
-            # Secret определяется в k8s/secrets.example.yaml → секции data-platform.
             - secretRef:
                 name: minio-credentials
           volumeMounts:
@@ -97,11 +91,11 @@ spec:
               subPath: metastore-site.xml
           resources:
             requests:
-              cpu: 200m
-              memory: 512Mi
+              cpu: 150m
+              memory: 384Mi
             limits:
-              cpu: 1
-              memory: 1Gi
+              cpu: 500m
+              memory: 768Mi
           readinessProbe:
             tcpSocket:
               port: 9083

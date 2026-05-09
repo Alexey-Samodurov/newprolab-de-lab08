@@ -1,8 +1,5 @@
 #!/bin/sh
-# Раскладывает flat-configmap dbt-project в нормальную dbt-структуру в /tmp/dbt-project.
-# Используется из airflow/dags/transactions_pipeline.py (KubernetesPodOperator).
-# Источник: ConfigMap `dbt-project` (см. Makefile target `dbt-configmap`),
-# смонтированный в /tmp/cm; выходная dbt-структура — в /tmp/dbt-project (emptyDir).
+
 set -e
 mkdir -p /tmp/dbt-project && cd /tmp/dbt-project
 mkdir -p models/silver models/gold tests macros

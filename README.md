@@ -8,13 +8,13 @@ medallion-хранилище на Hudi/MinIO, трансформации чер�
 ## Архитектура
 
 ```
-S3 / MinIO (lake/raw/)     ──► PySpark Structured Streaming (long-running SparkApp)
+YC S3 (npl-de18-lab8-data)  ──► PySpark Structured Streaming (long-running SparkApp)
                                               │  • file source, foreachBatch → Hudi upsert
                                               │  • exactly-once на уровне файлов через checkpoint
-Kafka (внешний)            ──► PySpark Structured Streaming (long-running SparkApp)
+Kafka (внешний, off)        ──► PySpark Structured Streaming (long-running SparkApp)
                                               │
                                              ▼
-                            Hudi CoW tables (bronze/silver/gold) on MinIO
+                            Hudi CoW tables (bronze/silver/gold) on MinIO `lake/`
                                               │
                                               ▼
                                    Trino 470+ ──► Superset (dashboards)
@@ -162,9 +162,9 @@ make streaming-apps
 | `bronze.transactions` | S3 streaming (file source, JSONL) — публичный YC бакет `npl-de18-lab8-data` | ~10 мин слот | `composite_pk` = `transaction_id\|created_at\|user_id` |
 | `bronze.cancellations` | S3 streaming — `npl-de18-lab8-data/cancellations/` | 1 раз в день | `cancellation_id` |
 | `bronze.exchange_rates` | S3 streaming — `npl-de18-lab8-data/exchange_rates/` (партиции `day=`) | 2-3 раза в день | `update_id` |
-| `bronze.users` | S3 streaming (reference, MinIO seed: `s3a://lake/raw/reference/`) | snapshot | `user_id` |
-| `bronze.test_users` | S3 streaming (reference, MinIO seed) | snapshot | `test_user_uuid` |
-| `bronze.promo_codes` | S3 streaming (reference, MinIO seed) | snapshot | `promo_code_id` |
+| `bronze.users` | S3 streaming (reference, `s3a://npl-de18-lab8-data/reference/`) | snapshot | `user_id` |
+| `bronze.test_users` | S3 streaming (reference) | snapshot | `test_user_uuid` |
+| `bronze.promo_codes` | S3 streaming (reference) | snapshot | `promo_code_id` |
 | `bronze.events_kafka` | Kafka streaming | real-time | `composite_pk` |
 
 Все bronze-таблицы наполняются **через Hudi upsert**, поэтому корректно отрабатывают
@@ -231,7 +231,7 @@ SparkApplication'ами `bronze-s3-streaming` и `bronze-kafka-ingest`, кото
 
 **Bronze ingest detail.** Long-running Spark Structured Streaming (4 параллельных
 file-source стрима в одной JVM: transactions / cancellations / exchange_rates /
-reference). Чекпойнты на `s3a://hudi/.checkpoints/bronze-s3-stream/*` гарантируют,
+reference). Чекпойнты на `s3a://checkpoints/bronze-s3-stream/*` гарантируют,
 что рестарт SparkApplication продолжает с offset'а. Дедупликация и поздние
 перезаливки файлов закрываются Hudi upsert'ом по `composite_pk`/`record_key`.
 
@@ -292,7 +292,7 @@ lab08/
 │       └── transactions_pipeline.py   # единственный DAG: sensor + dbt silver/gold/test
 ├── superset/
 │   └── init_dashboards.py       # bootstrap script: создаёт charts/dashboard через API
-└── sample/                      # sample данные от организаторов (используются для seed-reference и offline-режима через seed-sample)
+└── sample/                      # sample-данные от организаторов (для офлайн-разработки)
 ```
 
 ---

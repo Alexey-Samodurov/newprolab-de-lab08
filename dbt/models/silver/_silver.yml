@@ -16,6 +16,22 @@ models:
               values: ['completed', 'pending', 'failed', 'cancelled']
               config:
                 severity: warn
+      - name: is_user_missing
+        tests: [not_null]
+      - name: is_user_unknown
+        tests: [not_null]
+      - name: is_test_user
+        tests: [not_null]
+      - name: is_test_user_inconsistent
+        tests: [not_null]
+      - name: is_amount_invalid
+        tests: [not_null]
+      - name: is_revenue_eligible
+        tests: [not_null]
+      - name: is_transaction_id_duplicated
+        tests: [not_null]
+      - name: is_promo_expired_at_use
+        tests: [not_null]
 
   - name: cancellations_clean
     columns:
@@ -29,4 +45,21 @@ models:
       - name: rate_tgrk_punk
         tests: [not_null]
       - name: rate_tgrk_rub
+        tests: [not_null]
+
+  - name: exchange_rates_long
+    description: "Long-формат курсов: одна строка на (rate_day, currency). rate_to_tgrk=сколько единиц <currency> за 1 TGRK; TGRK→TGRK=1.0."
+    columns:
+      - name: rate_day_currency
+        tests: [not_null, unique]
+      - name: rate_day
+        tests: [not_null]
+      - name: currency
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['TGRK', 'PUNK', 'RUB']
+              config:
+                severity: warn
+      - name: rate_to_tgrk
         tests: [not_null]

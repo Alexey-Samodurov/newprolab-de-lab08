@@ -26,6 +26,9 @@ postgresql:
     resources:
       requests:
         cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
         memory: 512Mi
 
 redis:
@@ -144,11 +147,11 @@ _dagsSyncSidecar: &dagsSyncSidecar
 scheduler:
   resources:
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: 300m
+      memory: 768Mi
     limits:
-      cpu: 2
-      memory: 2Gi
+      cpu: 1
+      memory: 1536Mi
   extraVolumes: *dagsExtraVolumes
   extraVolumeMounts: *dagsExtraVolumeMounts
   extraInitContainers: *dagsInitContainers
@@ -157,11 +160,11 @@ scheduler:
 webserver:
   resources:
     requests:
-      cpu: 500m
-      memory: 1.5Gi
+      cpu: 250m
+      memory: 768Mi
     limits:
-      cpu: 2
-      memory: 3Gi
+      cpu: 1
+      memory: 1536Mi
   defaultUser:
     enabled: true
     role: Admin
@@ -176,11 +179,11 @@ triggerer:
   enabled: true
   resources:
     requests:
-      cpu: 300m
-      memory: 1Gi
+      cpu: 100m
+      memory: 512Mi
     limits:
-      cpu: 1
-      memory: 1.5Gi
+      cpu: 500m
+      memory: 768Mi
   extraVolumes: *dagsExtraVolumes
   extraVolumeMounts: *dagsExtraVolumeMounts
   extraInitContainers: *dagsInitContainers

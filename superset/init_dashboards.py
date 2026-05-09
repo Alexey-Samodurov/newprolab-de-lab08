@@ -131,8 +131,11 @@ DATASET_MAIN_DTTM = {
     "transactions_by_hour": "event_day",
     "purchases_by_hour":    "event_day",
     "revenue_daily":        "event_day",
+    "refunds_daily":        "cancel_day",
     "cancellations_summary": "cancel_day",
     "user_cohorts":         "event_day",
+    "promo_expired_usage_daily": "event_day",
+    "dq_summary_daily":     "event_day",
     # promo_codes_analysis — без time series (snapshot)
 }
 
@@ -295,15 +298,16 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
     # --- KPI row (Big Number) -------------------------------------------------
     charts["KPI: Total Revenue (TGRK)"] = upsert_chart(client, {
         "slice_name": "KPI: Total Revenue (TGRK)",
-        "description": "Совокупная выручка в базовой валюте TGRK по реальным пользователям. "
-                       "Конвертация PUNK/RUB → TGRK через дневные курсы (forward-fill).",
+        "description": "Совокупная GROSS-выручка в TGRK по реальным пользователям (без вычета "
+                       "refunds — см. отдельный график Daily Refunds). Конвертация PUNK/RUB → "
+                       "TGRK через дневные курсы (forward+backward fill из exchange_rates_long).",
         "viz_type": "big_number_total",
         "datasource_id": ds["revenue_daily"],
         "datasource_type": "table",
         "params": json.dumps({
-            "metric": simple_metric("revenue_tgrk", "SUM", "Revenue, TGRK"),
-            "y_axis_format": ",.0f",
-            "subheader": "сумма за весь период",
+            "metric": simple_metric("gross_revenue_tgrk", "SUM", "Gross Revenue, TGRK"),
+            "y_axis_format": "~s",
+            "subheader": "сумма за весь период (gross)",
         }),
     })
 
@@ -363,21 +367,25 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
     # --- Trends ---------------------------------------------------------------
     charts["Daily Revenue (TGRK)"] = upsert_chart(client, {
         "slice_name": "Daily Revenue (TGRK)",
-        "description": "Дневная выручка в TGRK. Конвертация валют по дневным курсам "
-                       "(forward-fill последним известным).",
+        "description": "Дневная GROSS-выручка в TGRK (без вычета refunds). Конвертация валют "
+                       "по дневным курсам (forward+backward fill из exchange_rates_long).",
         "viz_type": "echarts_timeseries_line",
         "datasource_id": ds["revenue_daily"],
         "datasource_type": "table",
         "params": json.dumps({
             "x_axis": "event_day",
             "time_grain_sqla": "P1D",
-            "metrics": [simple_metric("revenue_tgrk", "SUM", "Revenue, TGRK")],
+            "metrics": [simple_metric("gross_revenue_tgrk", "SUM", "Gross Revenue, TGRK")],
             "groupby": [],
             "row_limit": 10000,
             "color_scheme": "supersetColors",
-            "y_axis_format": ",.0f",
+            "y_axis_format": "~s",
             "x_axis_title": "Day",
-            "y_axis_title": "Revenue, TGRK",
+            "y_axis_title": "Gross Revenue, TGRK",
+            "y_axis_title_margin": 40,
+            "x_axis_title_margin": 30,
+            "xAxisLabelRotation": -45,
+            "truncateYAxis": True,
             "show_legend": False,
             "rich_tooltip": True,
             "markerEnabled": True,
@@ -402,9 +410,13 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "row_limit": 10000,
             "color_scheme": "supersetColors",
             "stack": "Stack",
-            "y_axis_format": "SMART_NUMBER",
+            "y_axis_format": "~s",
             "x_axis_title": "Day",
             "y_axis_title": "Transactions",
+            "y_axis_title_margin": 40,
+            "x_axis_title_margin": 30,
+            "xAxisLabelRotation": -45,
+            "truncateYAxis": True,
             "show_legend": True,
             "rich_tooltip": True,
         }),
@@ -425,9 +437,12 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "row_limit": 10000,
             "color_scheme": "supersetColors",
             "show_legend": True,
-            "y_axis_format": "SMART_NUMBER",
+            "y_axis_format": "~s",
             "x_axis_label": "Hour of day",
             "y_axis_label": "Transactions",
+            "left_margin": 80,
+            "bottom_margin": 60,
+            "x_ticks_layout": "45°",
         }),
     })
 
@@ -444,8 +459,12 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "row_limit": 24,
             "color_scheme": "supersetColors",
             "show_legend": False,
+            "y_axis_format": "~s",
             "x_axis_label": "Hour of day",
             "y_axis_label": "Purchases",
+            "left_margin": 80,
+            "bottom_margin": 60,
+            "x_ticks_layout": "45°",
         }),
     })
 
@@ -464,9 +483,13 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "color_scheme": "supersetColors",
             "stack": "Stack",
             "show_legend": True,
-            "y_axis_format": "SMART_NUMBER",
+            "y_axis_format": "~s",
             "x_axis_title": "Day",
             "y_axis_title": "Cancellations",
+            "y_axis_title_margin": 40,
+            "x_axis_title_margin": 30,
+            "xAxisLabelRotation": -45,
+            "truncateYAxis": True,
             "rich_tooltip": True,
         }),
     })
@@ -488,9 +511,13 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "color_scheme": "supersetColors",
             "stack": "Stack",
             "show_legend": True,
-            "y_axis_format": "SMART_NUMBER",
+            "y_axis_format": "~s",
             "x_axis_title": "Day",
             "y_axis_title": "Unique users",
+            "y_axis_title_margin": 40,
+            "x_axis_title_margin": 30,
+            "xAxisLabelRotation": -45,
+            "truncateYAxis": True,
             "rich_tooltip": True,
             "opacity": 0.5,
         }),
@@ -699,7 +726,7 @@ def upsert_dashboard(
                 [{"markdown": "### Lab08 — Transaction Analytics\n"
                               "Витрины gold-слоя поверх Hudi/Trino. Фильтры дашборда: "
                               "период `event_day` и `is_test_user` (по умолчанию — только real users).",
-                  "w": 12, "h": 4}],
+                  "w": 12, "h": 10}],
                 [{"chart_id": cid(n), "w": 12 // max(len(kpis), 1), "h": 28} for n in kpis],
                 [
                     {"chart_id": cid("Daily Revenue (TGRK)"), "w": 6, "h": 50},
@@ -711,7 +738,7 @@ def upsert_dashboard(
             "name": "Operations",
             "rows": [
                 [{"markdown": "### Операционные разрезы\n"
-                              "Профиль активности по часам суток + структура отмен.", "w": 12, "h": 3}],
+                              "Профиль активности по часам суток + структура отмен.", "w": 12, "h": 8}],
                 [
                     {"chart_id": cid("Transactions by Hour"), "w": 6, "h": 50},
                     {"chart_id": cid("Purchases by Hour"), "w": 6, "h": 50},
@@ -723,7 +750,7 @@ def upsert_dashboard(
             "name": "Users & Promo",
             "rows": [
                 [{"markdown": "### Пользователи и промокоды\n"
-                              "Когортное распределение DAU + детализация по промокодам.", "w": 12, "h": 3}],
+                              "Когортное распределение DAU + детализация по промокодам.", "w": 12, "h": 8}],
                 [{"chart_id": cid("User Cohorts: New vs Returning"), "w": 12, "h": 50}],
                 [{"chart_id": cid("Promo Codes Analysis"), "w": 12, "h": 60}],
             ],
@@ -810,9 +837,12 @@ def main() -> None:
         "transactions_by_hour",
         "purchases_by_hour",
         "revenue_daily",
+        "refunds_daily",
         "promo_codes_analysis",
+        "promo_expired_usage_daily",
         "cancellations_summary",
         "user_cohorts",
+        "dq_summary_daily",
     ]
     ds = {t: upsert_dataset(client, db_id, t) for t in tables}
 

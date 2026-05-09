@@ -2,9 +2,26 @@
   Gold: Анализ промокодов.
   Использования промокода (только успешные completed транзакции),
   vs лимиты, флаг просрочки.
+
+  ADR (FIX_PLAN P1-8): таблица агрегирует за всю историю по promo_code_id —
+  это семантика «текущее состояние использования». В модели НЕТ
+  `is_incremental()`-фильтра намеренно: каждый прогон возвращает полную
+  агрегацию по всей истории, а incremental MERGE по `promo_code_id` апсёртит
+  её целиком. Это эквивалентно full-refresh, но без DROP TABLE
+  (а значит — без проблемы «mismatch unique_key/primaryKey» в dbt-spark
+  table materialization, см. ADR #16 в lab08/PLAN.md).
+
+  Колонка `used_after_expiry` = ever_used_after_expiry за всю историю
+  (см. `gold/promo_expired_usage_daily` для метрики «доля транзакций
+  с просроченным промо за день»).
 #}
-{{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge', unique_key='promo_code_id',
-   options={'primaryKey': 'promo_code_id', 'preCombineField': 'updated_at', 'type': 'cow'}) }}
+{{ config(
+    materialized='incremental',
+    file_format='hudi',
+    incremental_strategy='merge',
+    unique_key='promo_code_id',
+    options={'primaryKey': 'promo_code_id', 'preCombineField': 'updated_at', 'type': 'cow'}
+) }}
 
 WITH usage AS (
     SELECT

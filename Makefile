@@ -1,11 +1,10 @@
 .PHONY: help check up down ns secrets diff status spark-image hms \
         spark-code dbt-configmap airflow-dags airflow-trigger-pipeline superset-init \
         ingress hosts images airflow-image hms-image rbac airflow-unpause wait-airflow ensure-buckets verify-trino \
-        bootstrap-pipeline seed-data seed-reference seed-sample streaming-apps kafka-streaming-app \
-        monitoring monitoring-dashboards
+        bootstrap-pipeline streaming-apps kafka-streaming-app reference-batch reset-watermarks \
+        monitoring monitoring-dashboards reset-cancellations
 
 KIND_CONTEXT ?= docker-desktop
-SAMPLE_DIR ?= lab08/sample
 
 help:
 	@echo "Lab08 — Транзакционная аналитика. Управление инфраструктурой."
@@ -20,7 +19,8 @@ help:
 	@echo "  make images                   - собрать все кастомные image (skip если уже есть)"
 	@echo "  make hms                      - применить hive-metastore deployment"
 	@echo "  make rbac                     - применить spark-rbac, airflow-rbac"
-	@echo "  make streaming-apps           - применить long-running streaming SparkApplications (S3 + Kafka)"
+	@echo "  make streaming-apps           - применить long-running streaming SparkApplications (S3) + reference batch"
+	@echo "  make reference-batch          - применить (или перезапустить) one-shot bronze-reference-batch SparkApplication"
 	@echo "  make ensure-buckets           - убедиться что lake bucket существует (для существующего MinIO)"
 	@echo "  make spark-code               - пересоздать ConfigMap spark-jobs-code из spark-jobs/*.py"
 	@echo "  make dbt-configmap            - пересоздать ConfigMap dbt-project из dbt/"
@@ -33,6 +33,9 @@ help:
 	@echo "  make verify-trino             - проверить что Trino отвечает и видит hudi.bronze.transactions"
 	@echo "  make airflow-trigger-pipeline - запустить DAG transactions_pipeline вручную (sensor сам подождёт bronze)"
 	@echo "  make superset-init            - создать datasources, charts и dashboard в Superset"
+	@echo "  make reset-cancellations      - одноразово вычистить дубли в bronze/silver cancellations"
+	@echo "                                  (drop tables + clear stream checkpoint; следующий run пересоберёт)"
+	@echo "  make reset-watermarks         - сбросить bronze.ingest_watermarks (при corrupted Hudi timeline)"
 	@echo "  make diff                     - helmfile diff (что изменится)"
 	@echo "  make status                   - kubectl get pods во всех namespaces проекта"
 	@echo "  make down                     - helmfile destroy + удалить HMS (PVC данные пропадут)"
@@ -82,7 +85,6 @@ up: ns secrets images
 	helmfile --quiet -l name=minio-operator sync
 	helmfile --quiet -l name=minio-tenant sync
 	$(MAKE) ensure-buckets
-	$(MAKE) seed-reference
 	$(MAKE) airflow-dags
 	@echo ">>> [2/3] Остальная инфраструктура (helmfile sync)..."
 	helmfile --quiet sync
@@ -129,6 +131,13 @@ rbac:
 # Airflow им не управляет — он живёт отдельно от orchestration слоя.
 # Идемпотентно: kubectl apply, повторный запуск не пересоздаёт running app.
 #
+# Reference (users / test_users / promo_codes) — отдельный one-shot
+# SparkApplication, см. lab08/ADR-002-reference-batch-split.md.
+# Применяется здесь же, т.к. логически часть bronze-bootstrap'а: пайплайн
+# silver/gold join'ится со справочниками. Идемпотентно: kubectl apply
+# на Completed SparkApplication ничего не пересоздаёт; для перезапуска
+# (если справочник реально обновили) — `make reference-batch`.
+#
 # NB: Kafka SparkApp применяется ОТДЕЛЬНО через `make kafka-streaming-app`,
 # т.к. внешний брокер (kafka.ijklmn.xyz:9092) недоступен в большинстве сред —
 # при включении он бы бесконечно рестартовал (см. ADR #24 в lab08/PLAN.md).
@@ -136,6 +145,19 @@ streaming-apps:
 	@echo ">>> Применяю streaming SparkApplication (S3)..."
 	kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
 	@echo "    SparkApp applied. bronze.* появится через ~1-3 мин (cold start)."
+	@$(MAKE) reference-batch
+
+# Reference one-shot: после успеха остаётся в Completed, retry'и только
+# по сетевым сбоям до S3 (restartPolicy: OnFailure × 3). Чтобы пересобрать
+# bronze.users / test_users / promo_codes из обновлённого snapshot —
+# вызови `make reference-batch` повторно: target снесёт старый SparkApp
+# и создаст новый.
+reference-batch:
+	@echo ">>> Применяю bronze-reference-batch (one-shot)..."
+	-kubectl -n spark-jobs delete sparkapplication bronze-reference-batch --ignore-not-found --wait=true >/dev/null 2>&1
+	kubectl apply -f k8s/spark-applications/bronze-reference-batch.yaml >/dev/null
+	@echo "    SparkApp applied. Дождись Completed:"
+	@echo "      kubectl -n spark-jobs get sparkapp bronze-reference-batch -w"
 
 # Kafka streaming SparkApp — применять только когда брокер реально доступен,
 # иначе бесконечный CrashLoopBackOff. См. ADR #24.
@@ -154,76 +176,9 @@ ensure-buckets:
 	done
 	@kubectl -n storage wait --for=condition=ready pod -l v1.min.io/tenant=lab08 --timeout=300s >/dev/null
 	@MINIO_POD=$$(kubectl -n storage get pod -l v1.min.io/tenant=lab08 -o jsonpath='{.items[0].metadata.name}'); \
-	  for b in lake hudi warehouse checkpoints artifacts; do \
+	  for b in lake checkpoints artifacts; do \
 	    kubectl -n storage exec $$MINIO_POD -c minio -- sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin123 >/dev/null 2>&1 && mc mb --ignore-existing local/$$b 2>&1 | grep -v 'already exists'" || true; \
 	  done
-
-# `seed-reference`  : льёт ТОЛЬКО reference/{users,test_users,promo_codes}.jsonl в
-#                     s3://lake/raw/reference/. Нужен в production-пайплайне,
-#                     потому что публичный YC бакет `npl-de18-lab8-data` пока
-#                     не содержит `reference/` — bronze-стрим читает справочники
-#                     из MinIO. Запускается из `make up`.
-# `seed-sample`     : льёт sample-транзакции / отмены / курсы в s3://lake/raw/...
-#                     для локальной разработки БЕЗ публичного бакета. Если
-#                     bronze-стрим переключить arguments на s3a://lake/raw — он
-#                     заработает оффлайн. По умолчанию НЕ запускается из `make up`.
-# `seed-data`       : alias = seed-reference + seed-sample (исторический контракт).
-#
-# Раскладка совпадает с тем, что читает spark-jobs/bronze_s3_streaming.py:
-#   batch/day={d}/slot=00/transactions.jsonl       (за дни из SEED_DAYS)
-#   cancellations/day={d}/cancellations.jsonl
-#   exchange_rates/rates.jsonl                      (flat — для оффлайн-режима)
-#   reference/{users,test_users,promo_codes}.jsonl
-# Идемпотентно: --overwrite. Дни берутся из аргумента (по умолчанию 2025-10-06,2025-10-07).
-# NB: повторный seed с теми же ключами не гарантированно реобрабатывается file source —
-# для полного reset удалить s3://hudi/.checkpoints/bronze-s3-stream*/* и bronze-таблицы.
-SEED_DAYS ?= 2025-10-06 2025-10-07
-
-seed-data: seed-reference seed-sample
-
-seed-reference:
-	@echo ">>> Загружаю reference-справочники в s3://lake/raw/reference/..."
-	@kubectl -n data-platform delete pod mc-seed-ref --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl -n data-platform run mc-seed-ref \
-	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
-	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
-	  --command -- sh -c 'sleep 600' >/dev/null
-	@kubectl -n data-platform wait --for=condition=Ready pod/mc-seed-ref --timeout=60s >/dev/null
-	@kubectl -n data-platform exec -i mc-seed-ref -- sh -c 'cat > /tmp/users.jsonl' < $(SAMPLE_DIR)/users.jsonl
-	@kubectl -n data-platform exec -i mc-seed-ref -- sh -c 'cat > /tmp/test_users.jsonl' < $(SAMPLE_DIR)/test_users.jsonl
-	@kubectl -n data-platform exec -i mc-seed-ref -- sh -c 'cat > /tmp/promo_codes.jsonl' < $(SAMPLE_DIR)/promo_codes.jsonl
-	@kubectl -n data-platform exec mc-seed-ref -- sh -c '\
-	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
-	  mc cp --quiet /tmp/users.jsonl       m/lake/raw/reference/users.jsonl && \
-	  mc cp --quiet /tmp/test_users.jsonl  m/lake/raw/reference/test_users.jsonl && \
-	  mc cp --quiet /tmp/promo_codes.jsonl m/lake/raw/reference/promo_codes.jsonl && \
-	  echo "    s3://lake/raw/reference: $$(mc ls --recursive m/lake/raw/reference | wc -l) файлов"'
-	@kubectl -n data-platform delete pod mc-seed-ref --wait=false >/dev/null 2>&1 || true
-
-# Опциональный seed sample-транзакций для локальной разработки без публичного
-# бакета. Использовать вместе с переопределением arguments bronze-streaming.
-seed-sample:
-	@echo ">>> Загружаю sample транзакций / отмен / курсов в s3://lake/raw/..."
-	@kubectl -n data-platform delete pod mc-seed-sample --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl -n data-platform run mc-seed-sample \
-	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
-	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
-	  --command -- sh -c 'sleep 600' >/dev/null
-	@kubectl -n data-platform wait --for=condition=Ready pod/mc-seed-sample --timeout=60s >/dev/null
-	@for d in $(SEED_DAYS); do \
-	  kubectl -n data-platform exec -i mc-seed-sample -- sh -c "cat > /tmp/transactions-$$d.jsonl" < $(SAMPLE_DIR)/transactions_sample.jsonl; \
-	  kubectl -n data-platform exec -i mc-seed-sample -- sh -c "cat > /tmp/cancellations-$$d.jsonl" < $(SAMPLE_DIR)/cancellations_sample.jsonl; \
-	done
-	@kubectl -n data-platform exec -i mc-seed-sample -- sh -c 'cat > /tmp/rates.jsonl' < $(SAMPLE_DIR)/exchange_rates_sample.jsonl
-	@kubectl -n data-platform exec mc-seed-sample -- sh -c '\
-	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
-	  for d in $(SEED_DAYS); do \
-	    mc cp --quiet /tmp/transactions-$$d.jsonl m/lake/raw/batch/day=$$d/slot=00/transactions.jsonl && \
-	    mc cp --quiet /tmp/cancellations-$$d.jsonl m/lake/raw/cancellations/day=$$d/cancellations.jsonl; \
-	  done && \
-	  mc cp --quiet /tmp/rates.jsonl       m/lake/raw/exchange_rates/rates.jsonl && \
-	  echo "    s3://lake/raw: $$(mc ls --recursive m/lake/raw | wc -l) файлов"'
-	@kubectl -n data-platform delete pod mc-seed-sample --wait=false >/dev/null 2>&1 || true
 
 diff:
 	helmfile diff
@@ -241,6 +196,7 @@ down:
 	@echo ">>> 2/6 Удаляю ручные манифесты (HMS / streaming / Ingress / RBAC / secrets)..."
 	-kubectl delete -f k8s/spark-applications/bronze-s3-streaming.yaml --ignore-not-found
 	-kubectl delete -f k8s/spark-applications/bronze-kafka-ingest.yaml --ignore-not-found
+	-kubectl delete -f k8s/spark-applications/bronze-reference-batch.yaml --ignore-not-found
 	-kubectl delete -f k8s/hive-metastore.yaml --ignore-not-found
 	-kubectl delete -f k8s/ingress.yaml --ignore-not-found
 	-kubectl delete -f k8s/airflow-rbac.yaml --ignore-not-found
@@ -279,17 +235,22 @@ dbt-configmap:
 	  --from-file=profiles.yml=dbt/profiles.yml \
 	  --from-file=dbt-init.sh=dbt/dbt-init.sh \
 	  --from-file=macros_generate_schema_name.sql=dbt/macros/generate_schema_name.sql \
+	  --from-file=macros_run_date.sql=dbt/macros/run_date.sql \
 	  --from-file=sources.yml=dbt/models/sources.yml \
 	  --from-file=silver_transactions_clean.sql=dbt/models/silver/transactions_clean.sql \
 	  --from-file=silver_cancellations_clean.sql=dbt/models/silver/cancellations_clean.sql \
 	  --from-file=silver_exchange_rates_daily.sql=dbt/models/silver/exchange_rates_daily.sql \
+	  --from-file=silver_exchange_rates_long.sql=dbt/models/silver/exchange_rates_long.sql \
 	  --from-file=silver__silver.yml=dbt/models/silver/_silver.yml \
 	  --from-file=gold_transactions_by_hour.sql=dbt/models/gold/transactions_by_hour.sql \
 	  --from-file=gold_purchases_by_hour.sql=dbt/models/gold/purchases_by_hour.sql \
 	  --from-file=gold_revenue_daily.sql=dbt/models/gold/revenue_daily.sql \
+	  --from-file=gold_refunds_daily.sql=dbt/models/gold/refunds_daily.sql \
 	  --from-file=gold_promo_codes_analysis.sql=dbt/models/gold/promo_codes_analysis.sql \
+	  --from-file=gold_promo_expired_usage_daily.sql=dbt/models/gold/promo_expired_usage_daily.sql \
 	  --from-file=gold_cancellations_summary.sql=dbt/models/gold/cancellations_summary.sql \
 	  --from-file=gold_user_cohorts.sql=dbt/models/gold/user_cohorts.sql \
+	  --from-file=gold_dq_summary_daily.sql=dbt/models/gold/dq_summary_daily.sql \
 	  --from-file=gold__gold.yml=dbt/models/gold/_gold.yml \
 	  --from-file=test_recon_silver_transactions_count.sql=dbt/tests/recon_silver_transactions_count.sql \
 	  --from-file=test_recon_cancellations_orphan_rate.sql=dbt/tests/recon_cancellations_orphan_rate.sql \
@@ -400,13 +361,17 @@ airflow-trigger-pipeline:
 	kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags trigger transactions_pipeline
 
 # Bootstrap: гарантирует, что lab08 пройден end-to-end к моменту superset-init.
-#   1) если gold уже наполнен И последний DAGRun = success (значит dbt_test
-#      прошёл) → skip;
+#   1) если gold уже наполнен → skip (любой success-run наполнил витрины);
 #   2) если scheduler уже создал run (queued/running) → НЕ триггерим вручную,
 #      иначе получаем 2 параллельных run'а (manual + scheduled), которые
 #      max_active_runs=1 сериализует → пайплайн крутится дважды;
-#   3) иначе триггерим manual run (cold-start, чтобы не ждать */30 cron-окна);
-#   4) ждём state=success у самого свежего run'а — это включает dbt_test.
+#   3) иначе триггерим manual run за прошлый день (cold-start).
+#   4) ждём ПЕРВЫЙ успешный DAGRun (любой execution_date) — после него
+#      gold уже содержит данные за тот day и Superset можно поднимать.
+#      ВАЖНО: с catchup=True scheduler создаёт ~30 DAGRun-ов на месячную
+#      историю и max_active_runs=1 гонит их последовательно. Ждать success
+#      САМОГО свежего execution_date неправильно — это часы. Дашборд
+#      работает с любого первого успеха.
 bootstrap-pipeline:
 	@set -e; \
 	SCHEDULER_POD=$$(kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'); \
@@ -417,17 +382,21 @@ bootstrap-pipeline:
 	         | tail -1 | tr -d '"' | tr -d ' '); \
 	  case "$$out" in [1-9]*) return 0 ;; *) return 1 ;; esac; \
 	}; \
-	last_run_state() { \
+	any_run_success() { \
 	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
-	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; rs.sort(key=lambda r: r.get('execution_date',''), reverse=True); print(rs[0]['state'] if rs else '')" 2>/dev/null; \
+	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state')=='success' for r in rs) else 1)"; \
+	}; \
+	any_run_failed() { \
+	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
+	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state')=='failed' for r in rs) else 1)"; \
 	}; \
 	has_active_run() { \
 	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
 	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state') in ('queued','running') for r in rs) else 1)"; \
 	}; \
 	echo ">>> bootstrap: проверяю состояние pipeline..."; \
-	if count_positive hudi.gold.transactions_by_hour && [ "$$(last_run_state)" = "success" ]; then \
-	  echo "    gold наполнен и последний DAGRun=success — skip"; exit 0; \
+	if count_positive hudi.gold.transactions_by_hour; then \
+	  echo "    gold наполнен — skip"; exit 0; \
 	fi; \
 	if has_active_run; then \
 	  echo "    активный DAGRun уже есть (создан scheduler'ом) — жду без manual trigger"; \
@@ -435,17 +404,19 @@ bootstrap-pipeline:
 	  echo "    активного DAGRun нет — триггерю manual run..."; \
 	  af dags trigger transactions_pipeline >/dev/null 2>&1 || true; \
 	fi; \
-	echo ">>> жду success последнего DAGRun (до 25 мин: cold start Spark + bronze sensor + dbt silver/gold/test)..."; \
+	echo ">>> жду первый success DAGRun (до 25 мин: cold start Spark + bronze sensor + dbt silver/gold/test)..."; \
+	echo "    с catchup=True scheduler гонит ~30 catchup-runs последовательно — ждём ЛЮБОЙ success, не последний"; \
 	for i in $$(seq 1 150); do \
 	  sleep 10; \
-	  state=$$(last_run_state); \
-	  case "$$state" in \
-	    success) echo "    DAGRun success (попытка $$i/150) — dbt_test пройден"; exit 0 ;; \
-	    failed)  echo "ERR: DAGRun failed — проверь airflow UI: dag transactions_pipeline"; exit 1 ;; \
-	  esac; \
-	  if [ $$((i % 6)) = 0 ]; then echo "    жду DAGRun... state=$$state ($$i/150, ~$$((i / 6)) мин)"; fi; \
+	  if any_run_success; then \
+	    echo "    DAGRun success получен (попытка $$i/150) — gold наполнен, можно поднимать Superset"; exit 0; \
+	  fi; \
+	  if any_run_failed; then \
+	    echo "ERR: один из DAGRun-ов упал — проверь airflow UI: dag transactions_pipeline"; exit 1; \
+	  fi; \
+	  if [ $$((i % 6)) = 0 ]; then echo "    жду первый success... ($$i/150, ~$$((i / 6)) мин)"; fi; \
 	done; \
-	echo "ERR: DAGRun не завершился за 25 мин — посмотри SparkApplication bronze-s3-streaming, DAG transactions_pipeline"; exit 1
+	echo "ERR: ни один DAGRun не завершился успешно за 25 мин — посмотри SparkApplication bronze-s3-streaming, DAG transactions_pipeline"; exit 1
 
 # Инициализирует Superset: создаёт database connection (Trino), datasets, charts и dashboard.
 # Выполняется ВНУТРИ кластера: скрипт копируется в superset pod и запускается там
@@ -460,3 +431,69 @@ superset-init:
 	kubectl -n data-platform cp superset/init_dashboards.py $(SUPERSET_POD):/tmp/init_dashboards.py -c superset
 	@echo ">>> Запускаю инициализацию (REST API на localhost:8088 внутри пода)..."
 	kubectl -n data-platform exec $(SUPERSET_POD) -c superset -- python /tmp/init_dashboards.py --host http://localhost:8088
+
+# Одноразовая очистка cross-partition дублей в bronze.cancellations и
+# silver.cancellations_clean. После того как `bronze_s3_streaming.py` перешёл
+# на GLOBAL_BLOOM index, новые upsert-ы дедуплицируются корректно, но УЖЕ
+# накопленные дубли (~13051 строк) не пропадут сами — Hudi global-index
+# решает дубль только когда ключ ещё раз приходит со стороны источника.
+# Самый чистый путь — снести таблицы и checkpoint cancellations-стрима;
+# при следующем тике стрим заново пройдёт по S3 и наполнит таблицу с нуля,
+# уже без дублей. После этого нужно прогнать silver с --full-refresh.
+#
+# ВАЖНО: таргет НЕ трогает transactions/rates/reference — у них своя логика
+# и их данные не повреждены.
+reset-cancellations:
+	@echo ">>> 1/3 Удаляю Hive table bronze.cancellations и silver.cancellations_clean..."
+	@kubectl -n data-platform exec deploy/trino-coordinator -- \
+	  trino --execute "DROP TABLE IF EXISTS hudi.bronze.cancellations" >/dev/null 2>&1 || true
+	@kubectl -n data-platform exec deploy/trino-coordinator -- \
+	  trino --execute "DROP TABLE IF EXISTS hudi.silver.cancellations_clean" >/dev/null 2>&1 || true
+	@echo ">>> 2/3 Чищу S3-данные таблиц и checkpoint cancellations-стрима..."
+	@kubectl -n storage delete pod mc-reset-cancel --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@kubectl -n storage run mc-reset-cancel \
+	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
+	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
+	  --command -- sh -c 'sleep 120' >/dev/null
+	@kubectl -n storage wait --for=condition=Ready pod/mc-reset-cancel --timeout=60s >/dev/null
+	@kubectl -n storage exec mc-reset-cancel -- sh -c '\
+	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
+	  mc rm --recursive --force m/lake/bronze/cancellations/ >/dev/null 2>&1 || true; \
+	  mc rm --recursive --force m/lake/silver/cancellations_clean/ >/dev/null 2>&1 || true; \
+	  mc rm --recursive --force m/hudi/.checkpoints/bronze-s3-stream-yc/cancellations/ >/dev/null 2>&1 || true; \
+	  echo "    очищено: bronze/cancellations, silver/cancellations_clean, ckpt cancellations"'
+	@kubectl -n storage delete pod mc-reset-cancel --wait=false >/dev/null 2>&1 || true
+	@echo ">>> 3/3 Рестартую bronze-s3-streaming чтобы перечитать всё с нуля..."
+	@kubectl -n spark-jobs delete sparkapplication bronze-s3-streaming --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
+	@echo "    Готово. Дальше:"
+	@echo "      1) Дождись, пока bronze.cancellations наполнится (~3-5 мин);"
+	@echo "      2) Прогони silver с full-refresh: dbt run --select cancellations_clean --full-refresh"
+	@echo "         (или дождись следующего DAG-run'а — incremental сам пересоздаст пустую таблицу)."
+
+# Сбрасывает bronze.ingest_watermarks при corrupted Hudi timeline.
+# Симптом: HoodieRollbackException "Found commits after time, please rollback greater commits first".
+# Причина: multi-writer ситуация при сбое — inflight + completed коммиты вперемешку.
+# bronze.ingest_watermarks — производная таблица: после сброса первый успешный
+# foreachBatch / bootstrap её пересоздаст. Потеря данных — только история watermark'ов
+# (sensor увидит партицию заново при следующем коммите).
+reset-watermarks:
+	@echo ">>> 1/3 Удаляю Hive table bronze.ingest_watermarks..."
+	@kubectl -n data-platform exec deploy/trino-coordinator -- \
+ 	  trino --execute "DROP TABLE IF EXISTS hudi.bronze.ingest_watermarks" >/dev/null 2>&1 || true
+	@echo ">>> 2/3 Чищу S3-данные таблицы..."
+	@kubectl -n storage delete pod mc-reset-wm --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@kubectl -n storage run mc-reset-wm \
+ 	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
+ 	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
+ 	  --command -- sh -c 'sleep 60' >/dev/null
+	@kubectl -n storage wait --for=condition=Ready pod/mc-reset-wm --timeout=60s >/dev/null
+	@kubectl -n storage exec mc-reset-wm -- sh -c '\
+ 	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
+ 	  mc rm --recursive --force m/lake/bronze/ingest_watermarks/ >/dev/null 2>&1 || true; \
+ 	  echo "    очищено: bronze/ingest_watermarks"'
+	@kubectl -n storage delete pod mc-reset-wm --wait=false >/dev/null 2>&1 || true
+	@echo ">>> 3/3 Рестартую bronze-s3-streaming чтобы пересоздать таблицу..."
+	@kubectl -n spark-jobs delete sparkapplication bronze-s3-streaming --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
+	@echo "    Готово. bootstrap_watermark_table создаст таблицу заново на старте."

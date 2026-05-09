@@ -1,23 +1,4 @@
 ---
-# Bronze S3 streaming — long-running. Полностью заменяет batch bronze-ingest.
-# 4 параллельных file-source стрима в одной JVM (transactions, cancellations,
-# exchange_rates, reference) → Hudi upsert в bronze.* через foreachBatch.
-# Чекпойнты живут на s3a://hudi/.checkpoints/bronze-s3-stream/* — рестарт
-# SparkApplication (restartPolicy: Always) не теряет offset.
-#
-# Источники raw-данных (production-дефолт = публичный YC бакет):
-#   * transactions   : s3a://npl-de18-lab8-data/                  (day=*/slot=*/transactions.jsonl)
-#   * cancellations  : s3a://npl-de18-lab8-data/cancellations/    (day=*/cancellations.jsonl)
-#   * exchange_rates : s3a://npl-de18-lab8-data/exchange_rates/   (day=*/rates.jsonl)
-#   * reference      : s3a://lake/raw/reference/                  (MinIO seed — публичный
-#       бакет пока пуст в reference/, заливается через `make seed-reference`).
-#
-# Per-bucket Hadoop override (см. sparkConf ниже) разводит s3a:
-#   * `npl-de18-lab8-data` → https://storage.yandexcloud.net + Anonymous creds
-#   * остальные (lake/hudi/warehouse) → in-cluster MinIO + env creds
-#
-# Для локальной разработки (всё из MinIO) переопределить arguments на
-# s3a://lake/raw/{batch,cancellations,exchange_rates,reference} + ckpt-suffix.
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
@@ -30,17 +11,11 @@ spec:
   image: lab08/spark:3.5.8-hudi-1.1.1
   imagePullPolicy: IfNotPresent
   mainApplicationFile: "local:///opt/spark/jobs/bronze_s3_streaming.py"
-  # Чекпойнт-префикс bronze-s3-stream-yc — отдельный от исторического
-  # bronze-s3-stream (MinIO seed): file source хранит (path,mtime), смешивать
-  # offset'ы между разными источниками нельзя. При откате на MinIO — менять обратно.
   arguments:
     - "--transactions-path=s3a://npl-de18-lab8-data/"
     - "--cancellations-path=s3a://npl-de18-lab8-data/cancellations/"
     - "--rates-path=s3a://npl-de18-lab8-data/exchange_rates/"
-    - "--reference-path=s3a://lake/raw/reference/"
-    - "--ckpt-root=s3a://hudi/.checkpoints/bronze-s3-stream-yc"
-  # hudi_utils.py — общий хелпер; явно объявляем чтобы Spark разложил его в sys.path
-  # и driver/executor увидели импорт `from hudi_utils import ...`.
+    - "--ckpt-root=s3a://checkpoints/bronze-s3-stream-yc"
   deps:
     pyFiles:
       - "local:///opt/spark/jobs/hudi_utils.py"
@@ -53,7 +28,7 @@ spec:
     onSubmissionFailureRetryInterval: 30
   sparkConf:
     "spark.sql.catalogImplementation": "hive"
-    "spark.sql.warehouse.dir": "s3a://warehouse/"
+    "spark.sql.warehouse.dir": "s3a://lake/warehouse/"
     "spark.sql.extensions": "org.apache.spark.sql.hudi.HoodieSparkSessionExtension"
     "spark.serializer": "org.apache.spark.serializer.KryoSerializer"
     "spark.kryo.registrator": "org.apache.spark.HoodieSparkKryoRegistrar"
@@ -63,29 +38,27 @@ spec:
     "spark.hadoop.fs.s3a.path.style.access": "true"
     "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
     "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem"
-    # Берём creds из env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY),
-    # которые подставляются driver/executor через envSecretKeyRefs ниже.
-    # Никаких хардкоженных ключей в манифесте.
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
-    # Per-bucket override для публичного Yandex Object Storage. s3a поддерживает
-    # `fs.s3a.bucket.<name>.*` — настройки применяются ТОЛЬКО для этого бакета,
-    # не ломая дефолтный MinIO-таргет (lake/hudi/warehouse).
-    # AnonymousAWSCredentialsProvider — бакет публичный, ключи не нужны.
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.endpoint": "https://storage.yandexcloud.net"
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.path.style.access": "true"
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.connection.ssl.enabled": "true"
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider": "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
+    # 16 партиций для shuffle стадий — у нас типичный micro-batch это
+    # 50–500k rows, 200 (default) генерит overhead на task scheduling и
+    # мелкие parquet'ы. 16 совпадает с hudi.upsert/insert.shuffle.parallelism.
+    "spark.sql.shuffle.partitions": "16"
     "spark.sql.streaming.numRecentProgressUpdates": "20"
-    # Observability: фиксируем namespace метрик (по умолчанию = spark.app.id, нестабилен).
-    # PrometheusServlet кладёт имена как metrics_<namespace>_<instance>_<source>_<metric>.
-    # С namespace=spark получаем единый префикс metrics_spark_* — дашборд использует его.
+    "spark.dynamicAllocation.enabled": "true"
+    "spark.dynamicAllocation.shuffleTracking.enabled": "true"
+    "spark.dynamicAllocation.minExecutors": "1"
+    "spark.dynamicAllocation.maxExecutors": "3"
+    "spark.dynamicAllocation.initialExecutors": "1"
+    "spark.dynamicAllocation.executorIdleTimeout": "120s"
+    "spark.dynamicAllocation.shuffleTracking.timeout": "300s"
     "spark.metrics.namespace": "spark"
     "spark.sql.streaming.metricsEnabled": "true"
-    # Inline metrics config: Spark Operator перетирает /opt/spark/conf нашим
-    # ConfigMap-ом, поэтому metrics.properties из image теряется. Передаём конфиг
-    # через spark.metrics.conf.* — Spark раскладывает их как метрики-properties.
     "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet"
     "spark.metrics.conf.*.sink.prometheusServlet.path": "/metrics/prometheus/"
     "spark.metrics.conf.master.sink.prometheusServlet.path": "/metrics/master/prometheus/"
@@ -94,14 +67,12 @@ spec:
     "spark.metrics.conf.executor.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
   driver:
     cores: 1
-    coreLimit: "2000m"
+    coreLimit: "1200m"
     memory: "1g"
+    memoryOverhead: "256m"
     serviceAccount: spark
     labels:
       app: bronze-s3-streaming
-    # Hudi metrics OFF (Hudi 1.1.1 PROMETHEUS reporter несовместим с публичным
-    # simpleclient_dropwizard — см. spark-jobs/hudi_utils.py). Spark UI /
-    # PrometheusServlet висят на 4040 (открывается Spark Operator-ом по умолчанию).
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials
@@ -114,8 +85,10 @@ spec:
         mountPath: /opt/spark/jobs
   executor:
     cores: 1
+    coreLimit: "1200m"
     instances: 1
-    memory: "1g"
+    memory: "2g"
+    memoryOverhead: "512m"
     labels:
       app: bronze-s3-streaming
     envSecretKeyRefs:

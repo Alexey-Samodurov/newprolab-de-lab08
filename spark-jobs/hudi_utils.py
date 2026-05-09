@@ -39,6 +39,7 @@ def hudi_opts(
     column_stats_cols: str | None = None,
     cluster_sort_cols: str | None = None,
     enable_record_index: bool = True,
+    global_index: bool = False,
 ) -> dict:
     """Build Hudi writer options for a CoW table with HMS sync.
 
@@ -59,6 +60,16 @@ def hudi_opts(
         enable_record_index: turn on Hudi RECORD_INDEX (HFile per recordkey
             in metadata table). Speeds up upsert when number of files
             grows. Disable for tiny / append-only tables.
+        global_index: use a GLOBAL_BLOOM index that scans ALL partitions for
+            the recordkey instead of only the incoming row's partition. Required
+            when partition path is NOT a deterministic function of the recordkey
+            (e.g. cancellations partitioned by event_day derived from
+            cancelled_ts: the same cancellation_id can land in different
+            event_day partitions across micro-batches → partition-scoped BLOOM
+            misses the existing record and produces cross-partition duplicates).
+            Pairs with `hoodie.bloom.index.update.partition.path=true` so Hudi
+            relocates the record into the new partition instead of inserting
+            a second copy. Mutually exclusive with RECORD_INDEX.
     """
     full_table = f"{table}{table_suffix}"
 
@@ -78,8 +89,8 @@ def hudi_opts(
         "hoodie.datasource.write.partitionpath.field": partition_field or "",
         "hoodie.datasource.write.hive_style_partitioning": "true",
         "hoodie.datasource.write.operation": "upsert",
-        "hoodie.upsert.shuffle.parallelism": "4",
-        "hoodie.insert.shuffle.parallelism": "4",
+        "hoodie.upsert.shuffle.parallelism": "16",
+        "hoodie.insert.shuffle.parallelism": "16",
         "hoodie.datasource.hive_sync.enable": "true",
         "hoodie.datasource.hive_sync.mode": "hms",
         "hoodie.datasource.hive_sync.database": db,
@@ -109,16 +120,37 @@ def hudi_opts(
         "hoodie.clean.commits.retained": "2",
 
         # --- archive: компактный .hoodie/ timeline -----------------------
-        "hoodie.archive.automatic": "true",
+        # ВАЖНО: archival ВЫКЛЮЧЕН глобально из-за известного бага
+        # trinodb/trino#26458 + apache/hudi#13994. В Hudi table version 8
+        # (default в 1.x) архивный timeline пишется как parquet в
+        # `.hoodie/timeline/history/`, а Trino-Hudi connector не умеет
+        # читать parquet timeline (TrinoHudiFileReaderFactory кидает
+        # `UnsupportedOperationException: ... does not support Parquet`).
+        # Симптом: любая bronze-таблица перестаёт читаться из Trino как
+        # только у неё накопится >keep.max коммитов и сработает archive.
+        # Workaround: archive выключен → timeline растёт линейно по числу
+        # коммитов, но cleaner всё равно физически удаляет старые data-
+        # файлы (см. clean.commits.retained=2 выше), так что место на S3
+        # не утекает. `.hoodie/` слегка раздут, но листинг при column-stats
+        # index всё равно не нужен. Включить обратно после релиза Hudi
+        # с фиксом + апгрейда trino-hudi.
+        "hoodie.archive.automatic": "false",
         "hoodie.keep.min.commits": "4",
         "hoodie.keep.max.commits": "5",
 
-        # --- inline clustering: меньше мелких файлов ---------------------
-        # Streaming пишет много маленьких parquet'ов; раз в 4 коммита
-        # схлопываем их в файлы 128MB, отсортированные по `cluster_sort_cols`.
-        # Сортировка → tighter min/max → агрессивный file-skipping в Trino.
-        "hoodie.clustering.inline": "true",
-        "hoodie.clustering.inline.max.commits": "4",
+        # --- async clustering: меньше мелких файлов БЕЗ блокировки commit -
+        # Раньше было `clustering.inline=true` — clustering выполнялся
+        # синхронно внутри commit'а раз в 4 коммита и для крупных tx batch'ей
+        # (370k+ rows) добавлял 60–120с к каждому 4-му commit'у → trigger
+        # уезжал на минуты, executors OOM-ились, micro-batch очередь росла.
+        # Теперь: inline=false + async.enabled=true → clustering планируется
+        # автоматически (replacecommit instant) и выполняется фоновым
+        # thread'ом писателя; основной upsert commit'ится за обычное время.
+        # Семантика та же: schedule раз в 4 commits, target 128MB, sort
+        # по cluster_sort_cols (event_day) → тот же file-skipping в Trino.
+        "hoodie.clustering.inline": "false",
+        "hoodie.clustering.async.enabled": "true",
+        "hoodie.clustering.async.max.commits": "4",
         "hoodie.clustering.plan.strategy.target.file.max.bytes": str(128 * 1024 * 1024),
         "hoodie.clustering.plan.strategy.small.file.limit": str(100 * 1024 * 1024),
         "hoodie.clustering.plan.strategy.sort.columns": cluster_sort_cols,
@@ -129,19 +161,6 @@ def hudi_opts(
         "hoodie.metadata.enable": "true",
         "hoodie.metadata.index.column.stats.enable": "true",
         "hoodie.metadata.index.column.stats.column.list": column_stats_cols,
-
-        # --- observability: Hudi metrics OFF ----------------------------
-        # KNOWN ISSUE (Hudi 1.1.1): нативный PROMETHEUS reporter падает с
-        # NoSuchMethodError в io.prometheus.client.dropwizard.DropwizardExports
-        # при первом commit, потому что Hudi шейдит Dropwizard MetricRegistry
-        # в org.apache.hudi.com.codahale.metrics.*, а стандартный
-        # simpleclient_dropwizard с Maven Central линкуется на unshaded
-        # com.codahale.metrics. Совместимый shaded jar Hudi на Maven Central
-        # не публикует. PUSHGATEWAY требует разворачивания push-gw, JMX тоже
-        # тянет JmxSink + javaagent. Поэтому Hudi metrics выключены, а
-        # наблюдаемость build-ится на Spark DAGScheduler (PrometheusServlet
-        # порт 4040) — см. lab08/OBSERVABILITY_PLAN.md → Known issues.
-        "hoodie.metrics.on": "false",
     }
 
     # Record-level index: HFile в metadata, маппинг recordkey → fileId.
@@ -149,7 +168,17 @@ def hudi_opts(
     # NB: Hudi 1.1.1 имеет известный баг "File pruning with partitioned rli has not yet
     # been implemented" — RLI несовместим с partitioned tables на read path. Для
     # партиционированных таблиц форсим BLOOM (старый, но рабочий путь).
-    if enable_record_index and not partition_field:
+    if global_index:
+        # GLOBAL_BLOOM: bloom-фильтры лежат в metadata table и индексируются
+        # по recordkey глобально, без partition-scope. Нужен когда partition
+        # path НЕ детерминированно выводится из PK (см. cancellations:
+        # event_day = date(cancelled_ts), а cancelled_ts может варьироваться
+        # для одного и того же cancellation_id между регенерациями source-файлов).
+        # update.partition.path=true → при нахождении PK в другой партиции Hudi
+        # ПЕРЕМЕЩАЕТ запись (delete старую + insert новую), а не дублирует.
+        opts["hoodie.index.type"] = "GLOBAL_BLOOM"
+        opts["hoodie.bloom.index.update.partition.path"] = "true"
+    elif enable_record_index and not partition_field:
         opts["hoodie.index.type"] = "RECORD_INDEX"
         opts["hoodie.metadata.record.level.index.enable"] = "true"
     else:
@@ -168,3 +197,33 @@ def write_hudi(df: DataFrame, opts: dict) -> None:
     for k, v in opts.items():
         w = w.option(k, v)
     w.mode("append").save()
+
+
+def reference_hudi_opts(table: str, db: str, pk: str) -> dict:
+    """Hudi-options для reference-таблиц: non-partitioned full snapshot.
+
+    Bronze reference == текущий snapshot upstream (см. ADR-002, FIX_PLAN P1-5):
+    `insert_overwrite_table` атомарно заменяет содержимое таблицы — записи,
+    выбывшие из upstream-snapshot, исчезают из bronze (zombie-устранение).
+
+    Используется из:
+      * `spark-jobs/bronze_reference_batch.py` — основной writer (one-shot job).
+
+    Параметры зафиксированы для случая «маленькая non-partitioned таблица
+    со snapshot-семантикой»:
+      * partition_field = ""              (reference не партиционируется);
+      * precombine = "ingested_at"        (DataFrame должен содержать колонку);
+      * column_stats = "ingested_at"      (минимальный индекс — справочник мал);
+      * record-index выключен             (для < 100k строк HFile-overhead не оправдан);
+      * operation = insert_overwrite_table.
+    """
+    opts = hudi_opts(
+        table, db,
+        pk=pk,
+        partition_field="",
+        precombine="ingested_at",
+        column_stats_cols="ingested_at",
+        enable_record_index=False,
+    )
+    opts["hoodie.datasource.write.operation"] = "insert_overwrite_table"
+    return opts

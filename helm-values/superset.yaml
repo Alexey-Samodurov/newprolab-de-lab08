@@ -29,6 +29,9 @@ postgresql:
       requests:
         cpu: 100m
         memory: 256Mi
+      limits:
+        cpu: 300m
+        memory: 512Mi
 
 redis:
   enabled: true
@@ -46,16 +49,16 @@ redis:
 supersetNode:
   resources:
     requests:
-      cpu: 500m
-      memory: 2Gi
+      cpu: 250m
+      memory: 1Gi
     limits:
-      cpu: 2
-      memory: 4Gi
+      cpu: 1
+      memory: 2Gi
 
 supersetWorker:
   resources:
     requests:
-      cpu: 300m
+      cpu: 200m
       memory: 1Gi
     limits:
       cpu: 1

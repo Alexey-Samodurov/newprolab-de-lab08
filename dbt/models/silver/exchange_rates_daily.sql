@@ -27,8 +27,11 @@ WITH ranked AS (
         ) AS rn
     FROM {{ source('bronze', 'exchange_rates') }}
     {% if is_incremental() %}
-      -- lookback покрывает поздние корректировки курсов (см. ADR #25)
-      WHERE timestamp >= unix_timestamp(date_sub(current_date(), {{ var('rates_lookback_days', 30) }}))
+      -- daily: курсы ровно за run_date. Если в этот день обновлений не было —
+      -- модель не запишет строку, gold/revenue_daily использует backward/forward-fill
+      -- (см. lab08/FIX_PLAN.md, P0-1, P1-1).
+      WHERE timestamp >= unix_timestamp({{ run_date() }})
+        AND timestamp <  unix_timestamp(date_add({{ run_date() }}, 1))
     {% endif %}
 )
 SELECT

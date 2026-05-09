@@ -17,12 +17,13 @@ WITH real_tx AS (
         amount,
         currency,
         status,
-        is_revenue_eligible
+        is_revenue_eligible,
+        ingested_at
     FROM {{ ref('transactions_clean') }}
     WHERE is_test_user = false
       AND is_user_missing = false
     {% if is_incremental() %}
-      AND event_day >= date_sub(current_date(), {{ var('transactions_lookback_days', 30) }})
+      AND event_day = {{ run_date() }}
     {% endif %}
 ),
 -- first_seen намеренно читает ВСЮ таблицу без incrementel-фильтра:
@@ -47,6 +48,7 @@ enriched AS (
         t.currency,
         t.status,
         t.is_revenue_eligible,
+        t.ingested_at,
         f.cohort_day,
         CASE WHEN f.cohort_day = t.event_day THEN 'new' ELSE 'returning' END AS user_type
     FROM real_tx t
@@ -61,6 +63,6 @@ SELECT
     sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_cnt,
     sum(CASE WHEN is_revenue_eligible THEN 1 ELSE 0 END) AS revenue_eligible_cnt,
     avg(amount)                                    AS avg_amount,
-    current_timestamp()                            AS updated_at
+    max(ingested_at)                               AS updated_at
 FROM enriched
 GROUP BY event_day, user_type

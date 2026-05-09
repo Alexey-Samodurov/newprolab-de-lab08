@@ -29,11 +29,9 @@ tenant:
   certificate:
     requestAutoCert: false
   buckets:
-    - name: hudi          # bronze/silver/gold таблицы (legacy путь, Hudi tables писались сюда раньше)
-    - name: lake          # bronze/silver/gold Hudi tables (актуальный s3a://lake/...)
-    - name: warehouse     # HMS warehouse директория
-    - name: checkpoints   # streaming чекпойнты
-    - name: artifacts     # spark logs, dbt manifests, airflow remote logs
+    - name: lake          # bronze/silver/gold Hudi tables + HMS warehouse (s3a://lake/warehouse/)
+    - name: checkpoints   # streaming чекпойнты (Spark Structured Streaming)
+    - name: artifacts     # spark logs, dbt manifests, airflow remote logs, DAG-файлы
   features:
     bucketDNS: false
     domains: {}

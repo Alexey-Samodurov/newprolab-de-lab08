@@ -2,7 +2,7 @@
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
-  name: bronze-kafka-ingest
+  name: bronze-reference-batch
   namespace: spark-jobs
 spec:
   type: Python
@@ -10,22 +10,24 @@ spec:
   mode: cluster
   image: lab08/spark:3.5.8-hudi-1.1.1
   imagePullPolicy: IfNotPresent
-  mainApplicationFile: "local:///opt/spark/jobs/bronze_kafka_ingest.py"
-  arguments: []
+  mainApplicationFile: "local:///opt/spark/jobs/bronze_reference_batch.py"
+  arguments:
+    - "--reference-path=s3a://npl-de18-lab8-data/reference/"
   deps:
     pyFiles:
       - "local:///opt/spark/jobs/hudi_utils.py"
+      - "local:///opt/spark/jobs/watermark_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
-    type: Always
-    onFailureRetries: 10
+    type: OnFailure
+    onFailureRetries: 3
     onFailureRetryInterval: 30
-    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetries: 3
     onSubmissionFailureRetryInterval: 30
+  timeToLiveSeconds: 10
   sparkConf:
     "spark.sql.catalogImplementation": "hive"
     "spark.sql.warehouse.dir": "s3a://lake/warehouse/"
-    "spark.sql.streaming.checkpointLocation": "s3a://checkpoints/bronze-kafka"
     "spark.sql.extensions": "org.apache.spark.sql.hudi.HoodieSparkSessionExtension"
     "spark.serializer": "org.apache.spark.serializer.KryoSerializer"
     "spark.kryo.registrator": "org.apache.spark.HoodieSparkKryoRegistrar"
@@ -36,23 +38,12 @@ spec:
     "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
     "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem"
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.endpoint": "https://storage.yandexcloud.net"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.path.style.access": "true"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.connection.ssl.enabled": "true"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider": "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
-    "spark.dynamicAllocation.enabled": "true"
-    "spark.dynamicAllocation.shuffleTracking.enabled": "true"
-    "spark.dynamicAllocation.minExecutors": "1"
-    "spark.dynamicAllocation.maxExecutors": "2"
-    "spark.dynamicAllocation.initialExecutors": "1"
-    "spark.dynamicAllocation.executorIdleTimeout": "120s"
-    "spark.dynamicAllocation.shuffleTracking.timeout": "300s"
-    "spark.metrics.namespace": "spark"
-    "spark.sql.streaming.metricsEnabled": "true"
-    "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet"
-    "spark.metrics.conf.*.sink.prometheusServlet.path": "/metrics/prometheus/"
-    "spark.metrics.conf.master.sink.prometheusServlet.path": "/metrics/master/prometheus/"
-    "spark.metrics.conf.applications.sink.prometheusServlet.path": "/metrics/applications/prometheus/"
-    "spark.metrics.conf.driver.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
-    "spark.metrics.conf.executor.source.jvm.class": "org.apache.spark.metrics.source.JvmSource"
   driver:
     cores: 1
     coreLimit: "1200m"
@@ -60,7 +51,7 @@ spec:
     memoryOverhead: "256m"
     serviceAccount: spark
     labels:
-      app: bronze-kafka-ingest
+      app: bronze-reference-batch
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials
@@ -68,12 +59,6 @@ spec:
       AWS_SECRET_ACCESS_KEY:
         name: lab08-credentials
         key: AWS_SECRET_ACCESS_KEY
-      KAFKA_BOOTSTRAP_SERVERS:
-        name: lab08-credentials
-        key: KAFKA_BOOTSTRAP_SERVERS
-      KAFKA_TOPIC:
-        name: lab08-credentials
-        key: KAFKA_TOPIC
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
@@ -84,7 +69,7 @@ spec:
     memory: "1g"
     memoryOverhead: "256m"
     labels:
-      app: bronze-kafka-ingest
+      app: bronze-reference-batch
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials

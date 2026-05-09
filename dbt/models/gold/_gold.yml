@@ -14,9 +14,20 @@ models:
       - name: updated_at
         tests: [not_null]
   - name: revenue_daily
+    description: "Дневная GROSS-выручка в TGRK (без вычета refunds — см. refunds_daily)."
     columns:
       - name: event_day
         tests: [unique, not_null]
+      - name: gross_revenue_tgrk
+      - name: updated_at
+        tests: [not_null]
+  - name: refunds_daily
+    description: "Дневной объём refund-ов по cancel_day. Не вычитается из revenue_daily — см. ADR P1-2."
+    columns:
+      - name: cancel_day
+        tests: [unique, not_null]
+      - name: refund_native_sum
+      - name: refund_cnt
       - name: updated_at
         tests: [not_null]
   - name: promo_codes_analysis
@@ -46,5 +57,19 @@ models:
           - not_null
           - accepted_values:
               values: ['new', 'returning']
+      - name: updated_at
+        tests: [not_null]
+  - name: promo_expired_usage_daily
+    description: "Дневная доля транзакций, использовавших промокод после expiry_date. См. P1-3."
+    columns:
+      - name: event_day
+        tests: [unique, not_null]
+      - name: updated_at
+        tests: [not_null]
+  - name: dq_summary_daily
+    description: "Сводка качества данных за day (count флагов из transactions_clean). См. P1-10."
+    columns:
+      - name: event_day
+        tests: [unique, not_null]
       - name: updated_at
         tests: [not_null]

@@ -4,8 +4,6 @@ lab08:
     dev:
       type: spark
       method: session
-      # `host` обязателен валидатором dbt-spark base credentials,
-      # для method=session значение игнорируется.
       host: NA
       schema: silver
       threads: 2

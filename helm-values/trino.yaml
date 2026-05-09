@@ -8,8 +8,8 @@ server:
   workers: 1
   config:
     query:
-      maxMemory: 2GB
-      maxMemoryPerNode: 1GB
+      maxMemory: 1500MB
+      maxMemoryPerNode: 768MB
   exchangeManager:
     name: filesystem
   # Разрешаем обработку X-Forwarded-For от ingress-nginx
@@ -21,20 +21,20 @@ server:
 coordinator:
   resources:
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: 250m
+      memory: 768Mi
     limits:
-      cpu: 2
-      memory: 2Gi
+      cpu: 1
+      memory: 1536Mi
 
 worker:
   resources:
     requests:
-      cpu: 500m
-      memory: 1Gi
+      cpu: 250m
+      memory: 768Mi
     limits:
-      cpu: 2
-      memory: 2Gi
+      cpu: 1
+      memory: 1536Mi
 
 additionalCatalogs:
   hudi: |

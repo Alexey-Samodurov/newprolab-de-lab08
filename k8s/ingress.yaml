@@ -1,19 +1,4 @@
 ---
-# Ingress-ресурсы для доступа к сервисам lab08 без port-forward.
-#
-# Предварительно необходимо добавить записи в /etc/hosts (make hosts):
-#   127.0.0.1  airflow.lab08.local
-#   127.0.0.1  superset.lab08.local
-#   127.0.0.1  trino.lab08.local
-#   127.0.0.1  s3.lab08.local
-#
-# После этого использовать:
-#   http://airflow.lab08.local   — Airflow UI  (admin / admin)
-#   http://superset.lab08.local  — Superset UI (admin / admin)
-#   http://trino.lab08.local     — Trino UI    (read-only query UI)
-#   http://s3.lab08.local        — MinIO S3 API (mc, aws cli, boto3)
-
-# ── Airflow ────────────────────────────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -36,7 +21,6 @@ spec:
                 port:
                   number: 8080
 ---
-# ── Superset ───────────────────────────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -59,7 +43,6 @@ spec:
                 port:
                   number: 8088
 ---
-# ── Trino ──────────────────────────────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -68,7 +51,6 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
-    # Trino проверяет Host header — передаём внутренний service hostname
     nginx.ingress.kubernetes.io/upstream-vhost: "trino.data-platform.svc.cluster.local"
 spec:
   ingressClassName: nginx
@@ -84,21 +66,6 @@ spec:
                 port:
                   number: 8080
 ---
-# ── MinIO S3 API ───────────────────────────────────────────────────────────────
-# Пробрасываем S3 API для подключения клиентами (mc, aws cli, boto3 и т.п.)
-#
-# Пример подключения с mc:
-#   mc alias set lab08 http://s3.lab08.local minioadmin <password>
-#   mc ls lab08/
-#
-# Пример с aws cli:
-#   aws --endpoint-url http://s3.lab08.local --no-sign-request s3 ls
-#   aws --endpoint-url http://s3.lab08.local s3 ls  (если профиль настроен)
-#
-# Пример с boto3:
-#   s3 = boto3.client("s3", endpoint_url="http://s3.lab08.local",
-#                     aws_access_key_id="minioadmin",
-#                     aws_secret_access_key="<password>")
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -108,13 +75,9 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
-    # Критично для AWS Sig V4: отключаем буферизацию тела запроса —
-    # иначе nginx разбивает chunked-поток и нарушает x-amz-content-sha256 подпись
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
-    # HTTP/1.1 обязателен для chunked transfer encoding (PutObject, multipart)
     nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
-    # Не сжимать — gzip изменяет тело и ломает подпись
     nginx.ingress.kubernetes.io/enable-gzip: "false"
 spec:
   ingressClassName: nginx

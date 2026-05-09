@@ -11,8 +11,11 @@ SELECT
     hour(created_ts)                                        AS hour_of_day,
     count(*)                                                AS purchase_cnt,
     sum(amount)                                             AS gross_amount_native,
-    current_timestamp()                                     AS updated_at
+    max(ingested_at)                                        AS updated_at
 FROM {{ ref('transactions_clean') }}
 WHERE is_revenue_eligible = true
   AND is_test_user = false
+{% if is_incremental() %}
+  AND event_day = {{ run_date() }}
+{% endif %}
 GROUP BY event_day, hour(created_ts)

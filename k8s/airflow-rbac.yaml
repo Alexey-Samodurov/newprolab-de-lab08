@@ -1,6 +1,4 @@
 ---
-# RBAC: дать Airflow worker SA право submit-ить SparkApplication, KubernetesPodOperator-pod-ы и
-# выполнять beeline-style операции в namespace spark-jobs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -23,15 +21,12 @@ metadata:
   name: airflow-spark-submit
   namespace: spark-jobs
 subjects:
-  # KubernetesExecutor / KubernetesPodOperator используют SA `airflow-worker` в namespace data-platform.
   - kind: ServiceAccount
     name: airflow-worker
     namespace: data-platform
-  # Scheduler сам делает list pods при `airflow tasks test` и при работе SparkKubernetesSensor.
   - kind: ServiceAccount
     name: airflow-scheduler
     namespace: data-platform
-  # На случай если Pod'ы создаются под `default` SA при первой инициализации.
   - kind: ServiceAccount
     name: default
     namespace: data-platform
