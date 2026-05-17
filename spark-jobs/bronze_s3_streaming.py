@@ -166,7 +166,7 @@ def start_file_stream(
     checkpoint: str,
     trigger_seconds: int = 30,
     max_files_per_trigger: int = 20,
-    max_file_age: str = "7d",
+    max_file_age: str = "30d",
 ):
     """Start a JSON file-based Structured Streaming query.
 
@@ -221,7 +221,7 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed arguments with source paths and checkpoint root.
     """
     p = argparse.ArgumentParser()
-    p.add_argument("--transactions-path", default="s3a://npl-de18-lab8-data/")
+    p.add_argument("--transactions-path", default="s3a://npl-de18-lab8-data/transactions/")
     p.add_argument("--cancellations-path", default="s3a://npl-de18-lab8-data/cancellations/")
     p.add_argument("--rates-path", default="s3a://npl-de18-lab8-data/exchange_rates/")
     p.add_argument("--ckpt-root", default="s3a://checkpoints/bronze-s3-stream")
