@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -7,6 +8,13 @@ from pyspark.sql import DataFrame, Row, SparkSession, functions as F
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from hudi_utils import hudi_opts, write_hudi
+
+# Serializes all writes to the single bronze.ingest_watermarks Hudi table.
+# Multiple Structured Streaming queries run their foreachBatch callbacks in
+# parallel driver threads; concurrent commits to the same (non-partitioned)
+# file group trigger HoodieWriteConflictException because Hudi's OCC +
+# SimpleConcurrentFileWritesConflictResolutionStrategy rejects any overlap.
+_WATERMARK_WRITE_LOCK = threading.Lock()
 
 
 WATERMARK_SCHEMA = StructType([
@@ -126,7 +134,8 @@ def write_watermark(
         for p in parts
     ]
     df = spark.createDataFrame(rows, schema=WATERMARK_SCHEMA)
-    write_hudi(df, _watermark_hudi_opts())
+    with _WATERMARK_WRITE_LOCK:
+        write_hudi(df, _watermark_hudi_opts())
     print(f"[watermark:{table_name} batch={batch_id}] partitions={parts}")
 
 
