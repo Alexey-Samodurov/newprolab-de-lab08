@@ -12,16 +12,21 @@ def read_latest_commit(
 ) -> tuple[str | None, list[str], int]:
     """Read the latest completed Hudi commit metadata from S3.
 
-    Returns ``(instant, partitions, rows_written)`` where ``partitions`` is the
-    raw set of keys from ``partitionToWriteStats`` (e.g. ``"event_day=2024-01-01"``
-    or ``""`` for non-partitioned tables) and ``rows_written`` is the sum of
-    ``numWrites + numUpdateWrites`` across all write stats.
+    Reads directly via Hadoop FS (no Spark job), so batch metrics are
+    obtained without scanning data.
 
-    If no new ``.commit`` instant exists since ``prev_instant`` (or the table
-    has no timeline yet), returns ``(latest_or_None, [], 0)``.
+    Args:
+        spark: Active SparkSession.
+        hudi_path: Base path of the Hudi table.
+        prev_instant: Previously observed instant; if it matches the
+            latest, no new metadata is returned.
 
-    Чтение идёт напрямую через Hadoop FS — без Spark job-а, поэтому метрики
-    батча получаем «бесплатно», не запуская count/distinct по данным.
+    Returns:
+        Tuple ``(instant, partitions, rows_written)`` where ``partitions``
+        contains raw ``partitionToWriteStats`` keys (e.g.
+        ``"event_day=2024-01-01"`` or ``""``) and ``rows_written`` is the
+        sum of ``numWrites + numUpdateWrites``. Returns
+        ``(latest_or_None, [], 0)`` when nothing new is available.
     """
     jvm = spark._jvm
     hconf = spark._jsc.hadoopConfiguration()
@@ -71,11 +76,18 @@ def normalize_partitions(
 ) -> list[str]:
     """Normalize raw Hudi partition keys to the watermark's ``day=<value>`` format.
 
-    Hudi с ``hive_style_partitioning=true`` пишет ключи вида
-    ``event_day=2024-01-01``. Watermark-таблица исторически хранит их как
-    ``day=<value>`` — здесь срезаем имя колонки и подставляем фиксированный
-    префикс, чтобы не ломать обратную совместимость с уже накопленными
-    записями.
+    Hudi with ``hive_style_partitioning=true`` emits keys like
+    ``event_day=2024-01-01``; the watermark table historically stores them
+    as ``day=<value>``. This strips the column name and prepends a fixed
+    prefix to preserve backward compatibility.
+
+    Args:
+        raw_parts: Raw partition keys from ``partitionToWriteStats``.
+        nonpartitioned_marker: Marker used when a key is empty.
+        out_prefix: Prefix prepended to extracted partition values.
+
+    Returns:
+        Sorted list of normalized partition keys.
     """
     out: set[str] = set()
     for p in raw_parts:

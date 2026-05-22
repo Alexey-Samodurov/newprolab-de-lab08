@@ -55,11 +55,14 @@ def overwrite_reference(
 ) -> None:
     """Overwrite a reference Hudi table from a JSON snapshot.
 
-    ``insert_overwrite_table`` Hudi-операция атомарна; downstream читает
-    консистентный снэпшот сразу после коммита. ``df.count()`` не делаем
-    (это лишний полный скан), а пустой DF фильтруется внутри ``write_hudi``
-    через дешёвый ``take(1)``. Watermark-запись тоже не нужна: никто не
-    читает её для reference-таблиц.
+    Args:
+        spark: Active SparkSession.
+        src_root: S3a prefix containing reference snapshots.
+        fname: JSON file name within ``src_root``.
+        table: Destination Hudi table name.
+        schema: Schema enforced on the source file.
+        pk: Recordkey column.
+        batch_id: Batch identifier used for logging.
     """
     path = f"{src_root.rstrip('/')}/{fname}"
     df = (
@@ -72,32 +75,28 @@ def overwrite_reference(
 
 
 def main() -> int:
-    """Run the reference batch job: overwrite each configured reference table.
-
-    Parses CLI arguments, selects the tables to process (optionally filtered by
-    whitelist), creates a SparkSession, and calls overwrite_reference for each
-    table. In strict mode (default), any failure causes a non-zero exit code.
+    """Run the reference batch job.
 
     Returns:
-        0 on success, 1 if any table failed to load or if no tables matched the whitelist.
+        0 on success, 1 if no tables matched the whitelist or any table
+        failed to load in strict mode.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--reference-path", required=True,
-        help="S3a-префикс с reference-файлами (e.g. s3a://npl-de18-lab8-data/reference/)",
+        help="S3a prefix with reference files (e.g. s3a://npl-de18-lab8-data/reference/)",
     )
     parser.add_argument(
         "--tables", default="",
-        help="Опциональный whitelist через запятую (users,test_users,promo_codes). "
-             "Пусто = все.",
+        help="Optional comma-separated whitelist (users,test_users,promo_codes). Empty = all.",
     )
     parser.add_argument(
         "--strict", dest="strict", action="store_true", default=True,
-        help="Падать если хотя бы один файл недоступен/пустой (default).",
+        help="Fail if any file is missing or empty (default).",
     )
     parser.add_argument(
         "--no-strict", dest="strict", action="store_false",
-        help="Отсутствующие файлы логировать и пропускать.",
+        help="Log missing files and continue.",
     )
     args = parser.parse_args()
 

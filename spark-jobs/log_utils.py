@@ -8,12 +8,14 @@ _CONFIGURED = False
 
 
 def configure_logging(level: str | int | None = None) -> None:
-    """Configure root logging once per process.
+    """Configure the root logger once per process.
 
-    Идёмпотентно: повторные вызовы не добавляют второй handler. Уровень
-    берётся из аргумента, иначе из ``LOG_LEVEL`` env, иначе ``INFO``.
-    Лог летит в ``stdout`` (а не stderr), чтобы не дублироваться с
-    Spark/Hudi-логами и нормально собирался k8s log-pipeline-ом.
+    Idempotent: subsequent calls do not add another handler. The level
+    falls back to the ``LOG_LEVEL`` env var or ``INFO``. Logs go to
+    ``stdout`` to avoid mixing with Spark/Hudi stderr output.
+
+    Args:
+        level: Optional logging level (name or numeric).
     """
     global _CONFIGURED
     if _CONFIGURED:
@@ -34,6 +36,13 @@ def configure_logging(level: str | int | None = None) -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a module logger, configuring root logging on first use."""
+    """Return a module logger, configuring root logging on first use.
+
+    Args:
+        name: Logger name (typically ``__name__``).
+
+    Returns:
+        Configured ``logging.Logger`` instance.
+    """
     configure_logging()
     return logging.getLogger(name)

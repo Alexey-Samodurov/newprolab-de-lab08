@@ -18,20 +18,25 @@ _LAST_INSTANT: dict[str, str | None] = {}
 
 
 def _init_last_instant(spark: SparkSession, table: str) -> None:
-    """Подтянуть текущий latest commit при старте.
+    """Prime the in-memory last-instant cache for a Hudi table.
 
-    Без этого первый микро-батч после рестарта повторно отправит watermark
-    для уже зафиксированного коммита.
+    Args:
+        spark: Active SparkSession.
+        table: Bronze table name under ``_HUDI_BASE``.
     """
     instant, _, _ = read_latest_commit(spark, f"{_HUDI_BASE}/{table}", None)
     _LAST_INSTANT[table] = instant
 
 
 def _emit_transactions_watermark(spark: SparkSession, batch_id: int) -> None:
-    """Single consumer of watermark table — Airflow sensor for transactions.
+    """Emit a watermark row per Hudi partition for the transactions table.
 
-    Метрики берём из Hudi commit-метаданных (Hadoop FS, без Spark job-а),
-    никаких persist/count/distinct по батчу.
+    Reads commit metadata directly from ``.hoodie/*.commit`` via Hadoop FS,
+    avoiding any Spark job over the micro-batch.
+
+    Args:
+        spark: Active SparkSession.
+        batch_id: Structured Streaming micro-batch id.
     """
     table = "transactions"
     path = f"{_HUDI_BASE}/{table}"
@@ -75,11 +80,12 @@ RATES_SCHEMA = StructType([
 
 
 def handle_transactions(spark: SparkSession, batch_df: DataFrame, batch_id: int) -> None:
-    """Process a micro-batch of transactions and upsert into bronze Hudi.
+    """Upsert a micro-batch of transactions into the bronze Hudi table.
 
-    Все преобразования собраны в один ``select`` (вместо цепочки
-    ``withColumn``), а event_day достаётся напрямую через ``from_unixtime``
-    с форматом, без промежуточного timestamp-каста.
+    Args:
+        spark: Active SparkSession.
+        batch_df: Raw micro-batch of transaction events.
+        batch_id: Structured Streaming micro-batch id.
     """
     if "day" in batch_df.columns:
         event_day_expr = F.coalesce(
@@ -110,11 +116,12 @@ def handle_transactions(spark: SparkSession, batch_df: DataFrame, batch_id: int)
 
 
 def handle_cancellations(spark: SparkSession, batch_df: DataFrame, batch_id: int) -> None:
-    """Process a micro-batch of cancellations and upsert into bronze Hudi.
+    """Upsert a micro-batch of cancellations into the bronze Hudi table.
 
-    Hudi сам дедуплицирует по recordkey + precombine, поэтому ранее
-    использованный ``dropDuplicates`` (полный shuffle на каждый батч)
-    убран. Watermark не пишем — downstream его не читает.
+    Args:
+        spark: Active SparkSession.
+        batch_df: Raw micro-batch of cancellation events.
+        batch_id: Structured Streaming micro-batch id.
     """
     df = batch_df.select(
         "*",
@@ -134,13 +141,16 @@ def handle_cancellations(spark: SparkSession, batch_df: DataFrame, batch_id: int
 
 
 def handle_rates(spark: SparkSession, batch_df: DataFrame, batch_id: int) -> None:
-    """Process a micro-batch of exchange rates and upsert into bronze Hudi.
+    """Upsert a micro-batch of exchange rates into the bronze Hudi table.
 
-    PK сделан композитным (``update_id|timestamp``), чтобы даже при
-    повторной отправке апстримом одного и того же ``update_id`` с другим
-    ``timestamp`` мы сохраняли историю котировок, а не затирали её через
-    precombine. Производное поле ``rate_day`` выводится в silver
-    (``exchange_rates_daily``) — в bronze оставляем только сырые поля.
+    Uses a composite ``update_id|timestamp`` recordkey so re-sent rate
+    updates with the same ``update_id`` but different ``timestamp`` keep
+    history instead of being collapsed by precombine.
+
+    Args:
+        spark: Active SparkSession.
+        batch_df: Raw micro-batch of exchange-rate events.
+        batch_id: Structured Streaming micro-batch id.
     """
     df = batch_df.select(
         "*",
@@ -173,12 +183,34 @@ def start_file_stream(
     max_file_age: str = "2d",
     glob: str | None = None,
     recursive: bool = False,
+    latest_first: bool = False,
 ):
-    """Start a JSON file-based Structured Streaming query."""
+    """Start a JSON file-based Structured Streaming query.
+
+    Args:
+        spark: Active SparkSession.
+        name: Query name shown in Spark UI and logs.
+        path: S3a directory to read JSON files from.
+        schema: Optional StructType enforced on the source.
+        handler: ``foreachBatch`` callable ``(batch_df, batch_id)``.
+        checkpoint: S3a path for the streaming checkpoint.
+        trigger_seconds: Processing trigger interval in seconds.
+        max_files_per_trigger: Max files consumed per trigger.
+        max_file_age: Max file age accepted by the source.
+        glob: Optional ``pathGlobFilter`` value.
+        recursive: Enable ``recursiveFileLookup`` for nested layouts.
+        latest_first: Process newest files first to catch up faster when
+            the directory grows unboundedly.
+
+    Returns:
+        The running ``StreamingQuery``.
+    """
     reader = (spark.readStream
               .format("json")
               .option("maxFilesPerTrigger", str(max_files_per_trigger))
               .option("maxFileAge", max_file_age)
+              .option("latestFirst", "true" if latest_first else "false")
+              .option("fileNameOnly", "false")
               .option("recursiveFileLookup", "true" if recursive else "false"))
     if glob is not None:
         reader = reader.option("pathGlobFilter", glob)
@@ -198,6 +230,11 @@ def start_file_stream(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for source paths and checkpoint root.
+
+    Returns:
+        Parsed argparse namespace.
+    """
     p = argparse.ArgumentParser()
     p.add_argument(
         "--transactions-path",
@@ -216,7 +253,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Bootstrap watermark table and start S3 file streams."""
+    """Bootstrap the watermark table and start all S3 file streams."""
     args = parse_args()
 
     spark = (SparkSession.builder
@@ -243,8 +280,9 @@ def main() -> None:
             glob="transactions.jsonl",
             handler=partial(handle_transactions, spark),
             checkpoint=f"{args.ckpt_root}/transactions",
-            trigger_seconds=60,
-            max_files_per_trigger=25,
+            trigger_seconds=120,
+            max_files_per_trigger=200,
+            latest_first=True,
         ),
         start_file_stream(
             spark, name="cancellations",

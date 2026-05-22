@@ -25,21 +25,15 @@ _BOOTSTRAPPED: set[str] = set()
 
 
 def _watermark_hudi_opts() -> dict:
-    """Cheap Hudi opts for the watermark table.
+    """Build minimal Hudi options for the watermark table.
 
-    Watermark — это per-partition маркер для downstream (Airflow sensor).
-    Дорогие фичи отключены:
+    The watermark table only carries a tiny marker row per partition for
+    downstream gating. Expensive features are disabled (metadata table,
+    column stats, clustering, multi-shuffle), while Hive sync stays on so
+    new ``table_name`` partitions become visible in HMS.
 
-    * ``hoodie.metadata.enable=false`` — никаких MDT-коммитов на каждую запись.
-    * ``shuffle.parallelism=1`` — одна-две строки на коммит.
-    * ``clustering=false`` — крошечные файлы, кластеризация бессмысленна.
-
-    ``hive_sync`` остаётся включённым: таблица партиционируется по
-    ``table_name``, и при появлении новой партиции (например, первого
-    батча ``transactions`` после bootstrap) её нужно зарегистрировать в
-    HMS, иначе Trino/Airflow не увидят строки. ``meta_sync.condition.sync``
-    в ``hudi_opts`` гарантирует, что HMS дёргается только при реальных
-    изменениях схемы/партиций, а не на каждый коммит.
+    Returns:
+        Hudi writer options dict.
     """
     opts = hudi_opts(
         _WATERMARK_TABLE, _WATERMARK_DB,
@@ -70,12 +64,17 @@ def write_watermark(
     rows_in_batch: int,
     batch_id: int,
 ) -> None:
-    """Emit one watermark row per partition for downstream (Airflow) gating.
+    """Emit one watermark row per partition for downstream gating.
 
-    Использует Hudi с минимальной обвязкой (см. ``_watermark_hudi_opts``).
-    Поле ``rows_in_batch`` нужно только как «> 0 → есть данные»; точное
-    значение приходит из Hudi commit-метаданных (``read_latest_commit``) и
-    дополнительный count по DataFrame не запускается.
+    ``rows_in_batch`` is informational only; the source-of-truth metric
+    comes from Hudi commit metadata, so no extra count is triggered.
+
+    Args:
+        spark: Active SparkSession.
+        table_name: Logical table the watermark belongs to.
+        partitions: Partition keys that received data in this batch.
+        rows_in_batch: Best-effort row count reported by the caller.
+        batch_id: Micro-batch identifier, logged for traceability.
     """
     parts = list(partitions)
     if not parts:
@@ -97,12 +96,14 @@ def write_watermark(
 
 
 def bootstrap_watermark_table(spark: SparkSession) -> None:
-    """Создать таблицу bronze.ingest_watermarks один раз за жизнь процесса.
+    """Create ``bronze.ingest_watermarks`` once per process if missing.
 
-    Раньше функция писала sentinel-строку при каждом старте → Hudi commit +
-    Hive sync. Теперь: проверяем существование через HMS, и только если
-    таблицы нет — создаём её одним bootstrap-коммитом с включённым
-    hive_sync. Повторные вызовы внутри одного процесса — no-op.
+    Checks HMS for table existence and only writes a sentinel bootstrap
+    row when the table is absent. Subsequent calls in the same process
+    are no-ops.
+
+    Args:
+        spark: Active SparkSession.
     """
     if _WATERMARK_TABLE in _BOOTSTRAPPED:
         return

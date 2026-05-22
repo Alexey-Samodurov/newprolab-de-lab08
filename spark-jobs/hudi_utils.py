@@ -22,35 +22,27 @@ def hudi_opts(
     """Build Hudi writer options for a CoW table with HMS sync.
 
     Args:
-        table: logical table name (e.g. "transactions").
-        db: target database (e.g. "bronze").
-        pk: recordkey field.
-        partition_field: partition column (or "" for non-partitioned).
-        precombine: precombine field (must monotonically increase per record).
-        table_suffix: appended to physical table name (e.g. "_kafka") to keep
-            multiple writers from clashing on the same Hudi timeline.
-        column_stats_cols: comma-separated list of columns to index in
-            metadata column-stats. Defaults to partition_field + precombine
-            if not given. Smaller list = compact index = faster query plan.
-        cluster_sort_cols: comma-separated list of columns to sort by when
-            clustering. Defaults to partition_field (if set) else pk —
-            sorted files have tighter min/max → better predicate pushdown.
-        enable_record_index: turn on Hudi RECORD_INDEX (HFile per recordkey
-            in metadata table). Speeds up upsert when number of files
-            grows. Disable for tiny / append-only tables.
-        global_index: use a GLOBAL_BLOOM index that scans ALL partitions for
-            the recordkey instead of only the incoming row's partition. Required
-            when partition path is NOT a deterministic function of the recordkey
-            (e.g. cancellations partitioned by event_day derived from
-            cancelled_ts: the same cancellation_id can land in different
-            event_day partitions across micro-batches → partition-scoped BLOOM
-            misses the existing record and produces cross-partition duplicates).
-            Pairs with `hoodie.bloom.index.update.partition.path=true` so Hudi
-            relocates the record into the new partition instead of inserting
-            a second copy. Mutually exclusive with RECORD_INDEX.
+        table: Logical table name (e.g. ``"transactions"``).
+        db: Target database (e.g. ``"bronze"``).
+        pk: Recordkey field.
+        partition_field: Partition column, or ``""`` for non-partitioned.
+        precombine: Precombine field (must monotonically increase per record).
+        table_suffix: Suffix appended to the physical table name to avoid
+            timeline clashes between concurrent writers.
+        column_stats_cols: Comma-separated columns indexed in column-stats.
+            Defaults to ``partition_field`` + ``precombine``.
+        cluster_sort_cols: Comma-separated columns to sort by during
+            clustering. Defaults to ``partition_field`` or ``pk``.
+        enable_record_index: Enable Hudi RECORD_INDEX for fast upserts.
+        global_index: Use GLOBAL_BLOOM index across all partitions. Needed
+            when the recordkey can move across partitions between batches.
+            Mutually exclusive with ``enable_record_index``.
+        shuffle_parallelism: Parallelism for upsert/insert/bulk/delete shuffles.
+        enable_column_stats: Toggle column-stats metadata index.
+        enable_hive_sync: Toggle Hive Metastore sync.
 
     Returns:
-        dict: Hudi writer options ready to be passed to ``df.write.format("hudi")``.
+        Hudi writer options ready for ``df.write.format("hudi")``.
     """
     full_table = f"{table}{table_suffix}"
 
@@ -123,11 +115,14 @@ def hudi_opts(
 
 
 def write_hudi(df: DataFrame, opts: dict) -> None:
-    """Append-mode upsert; no-op for empty batches (avoid empty-commit churn).
+    """Append-mode upsert that skips empty batches.
 
-    ``df.take(1)`` дешевле, чем ``df.rdd.isEmpty()``: запускает один task
-    на одной партиции и сразу останавливается, тогда как ``isEmpty`` через
-    RDD триггерит полноценный Spark job на каждый микро-батч.
+    Uses ``df.take(1)`` (single-task probe) instead of ``df.rdd.isEmpty()``
+    (full RDD job) so empty micro-batches cost almost nothing.
+
+    Args:
+        df: DataFrame to write.
+        opts: Hudi writer options.
     """
     if not df.take(1):
         return
@@ -138,21 +133,18 @@ def write_hudi(df: DataFrame, opts: dict) -> None:
 
 
 def reference_hudi_opts(table: str, db: str, pk: str) -> dict:
-    """
-    Generates Hudi configuration options for referencing specific Hudi tables.
+    """Build Hudi options for a non-partitioned reference snapshot table.
 
-    This function constructs a dictionary of options required to configure and
-    interact with a Hudi table. The provided arguments specify key attributes
-    of the target Hudi table, while additional settings are predefined for
-    insert overwrite operations.
+    Uses ``insert_overwrite_table`` for atomic full-snapshot rewrites and
+    keeps the metadata footprint minimal (no RECORD_INDEX, tiny shuffle).
 
     Args:
-        table (str): The name of the Hudi table.
-        db (str): The name of the database containing the Hudi table.
-        pk (str): The primary key column of the Hudi table.
+        table: Logical Hudi table name.
+        db: Target database.
+        pk: Recordkey column.
 
     Returns:
-        dict: A dictionary containing the Hudi table configuration options.
+        Hudi writer options dict.
     """
     opts = hudi_opts(
         table, db,

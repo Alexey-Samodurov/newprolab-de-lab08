@@ -39,10 +39,14 @@ EVENT_SCHEMA = StructType([
 
 
 def _emit_transactions_watermark(spark, batch_id: int) -> None:
-    """Watermark per Hudi-коммит для transactions (единственный consumer — Airflow).
+    """Emit a watermark row per partition for the transactions_kafka table.
 
-    Данные берём из ``.hoodie/*.commit`` (Hadoop FS, без Spark job-а),
-    никаких persist/count по микро-батчу.
+    Reads commit metadata directly from ``.hoodie/*.commit`` via Hadoop FS,
+    avoiding any Spark job over the micro-batch.
+
+    Args:
+        spark: Active SparkSession.
+        batch_id: Structured Streaming micro-batch id.
     """
     table = "transactions_kafka"
     path = f"{_HUDI_BASE}/{table}"
@@ -56,13 +60,12 @@ def _emit_transactions_watermark(spark, batch_id: int) -> None:
 
 
 def process_batch(spark, batch_df, batch_id):
-    """Route Kafka events to bronze Hudi tables without per-source persist/count.
+    """Route Kafka events to bronze Hudi tables by ``_source`` value.
 
-    Ранее каждый sub-DataFrame (tx/cancel/rates) шёл через
-    ``persist()`` + ``count()`` (полный скан) + повторный скан в write.
-    Сейчас: один проход чтения, ``write_hudi`` сам через ``take(1)``
-    отфильтровывает пустые батчи (один task вместо полного job-а),
-    Hudi дедуплицирует по recordkey+precombine.
+    Args:
+        spark: Active SparkSession.
+        batch_df: Parsed micro-batch DataFrame with an ``_source`` column.
+        batch_id: Structured Streaming micro-batch id.
     """
     tx = batch_df.filter(F.col("_source") == "transaction").select(
         "*",
@@ -117,6 +120,15 @@ def process_batch(spark, batch_df, batch_id):
 
 
 def main():
+    """Run the Kafka streaming ingest job.
+
+    Reads bootstrap servers and topic from argv or environment, parses
+    JSON events against ``EVENT_SCHEMA``, and routes each micro-batch
+    through ``process_batch``.
+
+    Raises:
+        RuntimeError: If ``KAFKA_BOOTSTRAP_SERVERS`` is not configured.
+    """
     bootstrap = (sys.argv[1] if len(sys.argv) > 1
                  else os.environ.get("KAFKA_BOOTSTRAP_SERVERS"))
     topic = (sys.argv[2] if len(sys.argv) > 2
@@ -125,8 +137,8 @@ def main():
 
     if not bootstrap:
         raise RuntimeError(
-            "KAFKA_BOOTSTRAP_SERVERS не задан (ни через argv, ни через env). "
-            "Проверь Secret lab08-credentials и envSecretKeyRefs в SparkApplication.")
+            "KAFKA_BOOTSTRAP_SERVERS is not configured (neither argv nor env). "
+            "Check Secret lab08-credentials and envSecretKeyRefs in SparkApplication.")
 
     spark = (SparkSession.builder
              .appName("bronze-kafka-ingest")

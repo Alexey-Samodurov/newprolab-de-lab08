@@ -1,35 +1,15 @@
-"""
-Superset bootstrap: создаёт database connection, datasets, charts и дашборд
-"Lab08 — Transaction Analytics" через REST API.
+"""Superset bootstrap for the Lab08 dashboard.
 
-Использование:
-    python superset/init_dashboards.py [--host http://localhost:8088] [--user admin] [--password admin]
+Creates the Trino database connection, gold datasets, charts and the
+``Lab08 - Transaction Analytics`` dashboard via the Superset REST API.
 
-Что создаётся:
-  1. Database connection → Trino (lab08-trino)
-  2. Datasets (gold.*) с проставленным main_dttm_col для time-series
-  3. Charts:
-     KPI-полоса (Big Number):
-       - KPI: Total Revenue (TGRK)
-       - KPI: Total Transactions
-       - KPI: Invalid Refund %
-       - KPI: Cancellations
-       - KPI: Active Users
-     Тренды:
-       - Daily Revenue (TGRK) — line
-       - Daily Transactions by Status — stacked bar
-     Операционные разрезы:
-       - Transactions by Hour (test vs real) — grouped bar
-       - Purchases by Hour — bar
-       - Cancellations by Reason — stacked bar по дням
-     Пользователи и промокоды:
-       - User Cohorts: New vs Returning — stacked area
-       - Promo Codes Analysis — table
-  4. Dashboard "Lab08 — Transaction Analytics" с tabs (Overview / Operations / Users & Promo)
-     и нативными фильтрами (event_day, is_test_user).
+Usage:
+    python superset/init_dashboards.py [--host http://localhost:8088] \
+        [--user admin] [--password admin]
 
-Идемпотентно: сущности обновляются по имени (PUT), а не пересоздаются, чтобы
-ручные правки в UI и chart_id оставались стабильными.
+The script is idempotent: entities are looked up by name and updated
+(PUT) instead of recreated, so manual UI tweaks and chart ids stay
+stable across runs.
 """
 from __future__ import annotations
 
@@ -246,7 +226,16 @@ def upsert_database(client: SupersetClient) -> int:
 
 
 def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None:
-    """Создаёт dataset, если его нет; затем проставляет main_dttm_col, если нужно."""
+    """Create the dataset if missing and set ``main_dttm_col`` when applicable.
+
+    Args:
+        client: Authenticated Superset client.
+        db_id: Target database id.
+        table: Gold table name.
+
+    Returns:
+        Dataset id, or ``None`` if the Trino table does not exist yet.
+    """
     existing = client.find_id("/api/v1/dataset/", "table_name", table)
     if existing:
         ds_id = existing
@@ -300,7 +289,15 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
 
 
 def upsert_chart(client: SupersetClient, payload: dict) -> int | None:
-    """Идемпотентный upsert: PUT по id если есть, иначе POST."""
+    """Idempotent chart upsert: PUT by id when present, otherwise POST.
+
+    Args:
+        client: Authenticated Superset client.
+        payload: Chart payload (must include ``slice_name``).
+
+    Returns:
+        Chart id, or ``None`` when the underlying dataset is missing.
+    """
     if payload.get("datasource_id") is None:
         log.warning("Chart '%s': skip (нет датасета)", payload['slice_name'])
         return None
@@ -319,7 +316,11 @@ def upsert_chart(client: SupersetClient, payload: dict) -> int | None:
 
 
 def cleanup_obsolete_charts(client: SupersetClient) -> None:
-    """Удаляем чарты от старых версий скрипта."""
+    """Delete charts that belonged to older versions of this script.
+
+    Args:
+        client: Authenticated Superset client.
+    """
     for stale in (
         "Daily Revenue in TGRK",
         "Promo Codes: Over-Limit Uses",
@@ -373,7 +374,15 @@ REAL_USERS_FILTER = adhoc_filter("is_test_user", "==", False)
 
 
 def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str, int | None]:
-    """Возвращает словарь slice_name → chart_id."""
+    """Create or update all dashboard charts.
+
+    Args:
+        client: Authenticated Superset client.
+        ds: Mapping of gold table name to dataset id.
+
+    Returns:
+        Mapping ``slice_name`` -> ``chart_id`` (id may be ``None``).
+    """
     charts: dict[str, int | None] = {}
 
     charts["KPI: Total Revenue (TGRK)"] = upsert_chart(client, {
@@ -641,14 +650,17 @@ def _new_id(prefix: str) -> str:
 
 
 def build_position_json(tabs_spec: list[dict], chart_meta: dict[int, dict]) -> dict:
-    """
-    tabs_spec: [
-        {"name": "Overview", "rows": [
-            [{"chart_id": 1, "w": 4, "h": 10}, ...],   # одна строка дашборда
-            [{"markdown": "## Header"}],
-        ]},
-    ]
-    chart_meta: chart_id → {"name": str, "uuid": str}
+    """Build the Superset ``position_json`` for a tabbed dashboard.
+
+    Args:
+        tabs_spec: Tab definitions; each tab has ``name`` and ``rows``,
+            where every row is a list of items describing either a chart
+            (``chart_id``, optional ``w``, ``h``) or a markdown block
+            (``markdown``, optional ``w``, ``h``).
+        chart_meta: Mapping ``chart_id -> {"name": str, "uuid": str}``.
+
+    Returns:
+        Position JSON dict ready to be serialised for Superset.
     """
     pos: dict[str, Any] = {
         "DASHBOARD_VERSION_KEY": "v2",
@@ -724,10 +736,19 @@ def build_native_filters(
     all_chart_ids: list[int],
     chart_ids_without_time: list[int],
 ) -> list[dict]:
-    """Глобальные фильтры дашборда: event_day и is_test_user.
+    """Build dashboard-level native filters for ``event_day`` and ``is_test_user``.
 
-    Scope формируем через `excluded` — это chart_id'ы, к которым фильтр НЕ применяется.
-    Так Superset не пытается добавить WHERE в чарты, где нужной колонки нет.
+    Scope is expressed via ``excluded`` chart ids so Superset only injects
+    each filter into charts whose datasets actually expose the column.
+
+    Args:
+        test_user_dataset_id: Dataset id used as the ``is_test_user`` source.
+        chart_ids_with_test_user: Charts that support the ``is_test_user`` filter.
+        all_chart_ids: All chart ids on the dashboard.
+        chart_ids_without_time: Charts that do not have a time column.
+
+    Returns:
+        ``native_filter_configuration`` list for ``json_metadata``.
     """
     filters: list[dict] = []
 
