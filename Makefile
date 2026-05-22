@@ -1,8 +1,8 @@
 .PHONY: help check up down ns secrets diff status spark-image hms \
-        spark-code dbt-configmap airflow-dags airflow-trigger-pipeline superset-init \
+        spark-code dbt-configmap airflow-dags airflow-trigger-bronze airflow-trigger-medallion superset-init \
         ingress hosts images airflow-image hms-image rbac airflow-unpause wait-airflow ensure-buckets verify-trino \
-        bootstrap-pipeline streaming-apps kafka-streaming-app reference-batch reset-watermarks \
-        monitoring monitoring-dashboards reset-cancellations
+        bootstrap-pipeline kafka-streaming-app reference-batch \
+        monitoring monitoring-dashboards
 
 KIND_CONTEXT ?= docker-desktop
 
@@ -19,8 +19,8 @@ help:
 	@echo "  make images                   - собрать все кастомные image (skip если уже есть)"
 	@echo "  make hms                      - применить hive-metastore deployment"
 	@echo "  make rbac                     - применить spark-rbac, airflow-rbac"
-	@echo "  make streaming-apps           - применить long-running streaming SparkApplications (S3) + reference batch"
 	@echo "  make reference-batch          - применить (или перезапустить) one-shot bronze-reference-batch SparkApplication"
+	@echo "  make kafka-streaming-app      - применить bronze-kafka-ingest SparkApplication (speed layer, опционально)"
 	@echo "  make ensure-buckets           - убедиться что lake bucket существует (для существующего MinIO)"
 	@echo "  make spark-code               - пересоздать ConfigMap spark-jobs-code из spark-jobs/*.py"
 	@echo "  make dbt-configmap            - пересоздать ConfigMap dbt-project из dbt/"
@@ -28,14 +28,12 @@ help:
 	@echo "  make monitoring               - применить ServiceMonitor/PodMonitor + Grafana dashboards"
 	@echo "  make monitoring-dashboards    - пересоздать ConfigMap c Grafana дашбордами"
 	@echo "  make hosts                    - добавить *.lab08.local в /etc/hosts (требует sudo)"
-	@echo "  make airflow-dags             - скопировать airflow/dags/ в под Airflow scheduler"
-	@echo "  make airflow-unpause          - снять с паузы DAG transactions_pipeline"
+	@echo "  make airflow-dags             - скопировать airflow/dags/ в S3 (s3://artifacts/dags/)"
+	@echo "  make airflow-unpause          - снять с паузы DAG'и bronze_s3_ingest и transactions_medallion"
 	@echo "  make verify-trino             - проверить что Trino отвечает и видит hudi.bronze.transactions"
-	@echo "  make airflow-trigger-pipeline - запустить DAG transactions_pipeline вручную (sensor сам подождёт bronze)"
+	@echo "  make airflow-trigger-bronze   - запустить DAG bronze_s3_ingest вручную"
+	@echo "  make airflow-trigger-medallion- запустить DAG transactions_medallion вручную"
 	@echo "  make superset-init            - создать datasources, charts и dashboard в Superset"
-	@echo "  make reset-cancellations      - одноразово вычистить дубли в bronze/silver cancellations"
-	@echo "                                  (drop tables + clear stream checkpoint; следующий run пересоберёт)"
-	@echo "  make reset-watermarks         - сбросить bronze.ingest_watermarks (при corrupted Hudi timeline)"
 	@echo "  make diff                     - helmfile diff (что изменится)"
 	@echo "  make status                   - kubectl get pods во всех namespaces проекта"
 	@echo "  make down                     - helmfile destroy + удалить HMS (PVC данные пропадут)"
@@ -83,7 +81,7 @@ up: ns secrets images
 	$(MAKE) rbac
 	$(MAKE) spark-code
 	$(MAKE) dbt-configmap
-	$(MAKE) streaming-apps
+	$(MAKE) reference-batch
 	$(MAKE) ingress
 	$(MAKE) monitoring
 	@echo "    Ожидаю Airflow scheduler..."
@@ -112,12 +110,6 @@ hms:
 rbac:
 	kubectl apply -f k8s/spark-rbac.yaml >/dev/null
 	kubectl apply -f k8s/airflow-rbac.yaml >/dev/null
-
-streaming-apps:
-	@echo ">>> Применяю streaming SparkApplication (S3)..."
-	kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
-	@echo "    SparkApp applied. bronze.* появится через ~1-3 мин (cold start)."
-	@$(MAKE) reference-batch
 
 reference-batch:
 	@echo ">>> Применяю bronze-reference-batch (one-shot)..."
@@ -156,8 +148,7 @@ down:
 	@echo ">>> 1/6 Удаляю SparkApplication-инстансы (могут блокировать ns terminate)..."
 	-kubectl -n spark-jobs delete sparkapplication --all --ignore-not-found --wait=false
 	-kubectl -n spark-jobs delete scheduledsparkapplication --all --ignore-not-found --wait=false
-	@echo ">>> 2/6 Удаляю ручные манифесты (HMS / streaming / Ingress / RBAC / secrets)..."
-	-kubectl delete -f k8s/spark-applications/bronze-s3-streaming.yaml --ignore-not-found
+	@echo ">>> 2/6 Удаляю ручные манифесты (HMS / SparkApps / Ingress / RBAC / secrets)..."
 	-kubectl delete -f k8s/spark-applications/bronze-kafka-ingest.yaml --ignore-not-found
 	-kubectl delete -f k8s/spark-applications/bronze-reference-batch.yaml --ignore-not-found
 	-kubectl delete -f k8s/hive-metastore.yaml --ignore-not-found
@@ -270,7 +261,7 @@ airflow-dags:
 
 airflow-unpause:
 	$(eval SCHEDULER_POD := $(shell kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'))
-	@for d in transactions_pipeline; do \
+	@for d in bronze_s3_ingest transactions_medallion; do \
 	  for i in 1 2 3 4 5 6; do \
 	    if kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags list 2>/dev/null | grep -q "^$$d "; then \
 	      kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags unpause $$d || true; \
@@ -287,17 +278,21 @@ verify-trino:
 	@kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW CATALOGS" 2>/dev/null | grep -q hudi \
 	  && echo "    catalog hudi: OK" || (echo "    catalog hudi: FAIL" && exit 1)
 	@kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW SCHEMAS FROM hudi" 2>/dev/null | grep -q bronze \
-	  && echo "    schema hudi.bronze: OK" || echo "    schema hudi.bronze: пока пусто (запусти make streaming-apps)"
+	  && echo "    schema hudi.bronze: OK" || echo "    schema hudi.bronze: пока пусто (дождись первого run DAG bronze_s3_ingest)"
 	@if kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SHOW TABLES FROM hudi.bronze" 2>/dev/null | grep -q transactions; then \
 	    echo -n "    bronze.transactions rows: "; \
 	    kubectl -n data-platform exec deploy/trino-coordinator -- trino --execute "SELECT count(*) FROM hudi.bronze.transactions" 2>/dev/null | tail -1; \
 	  else \
-	    echo "    bronze.transactions ещё не создана (создастся после первого micro-batch)"; \
+	    echo "    bronze.transactions ещё не создана (создастся после первого успешного DAG bronze_s3_ingest)"; \
 	  fi
 
-airflow-trigger-pipeline:
+airflow-trigger-bronze:
 	$(eval SCHEDULER_POD := $(shell kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'))
-	kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags trigger transactions_pipeline
+	kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags trigger bronze_s3_ingest
+
+airflow-trigger-medallion:
+	$(eval SCHEDULER_POD := $(shell kubectl -n data-platform get pod -l component=scheduler -o jsonpath='{.items[0].metadata.name}'))
+	kubectl -n data-platform exec $(SCHEDULER_POD) -- airflow dags trigger transactions_medallion
 
 bootstrap-pipeline:
 	@set -e; \
@@ -310,40 +305,45 @@ bootstrap-pipeline:
 	  case "$$out" in [1-9]*) return 0 ;; *) return 1 ;; esac; \
 	}; \
 	any_run_success() { \
-	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
+	  af dags list-runs -d $$1 -o json 2>/dev/null \
 	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state')=='success' for r in rs) else 1)"; \
 	}; \
 	any_run_failed() { \
-	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
+	  af dags list-runs -d $$1 -o json 2>/dev/null \
 	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state')=='failed' for r in rs) else 1)"; \
 	}; \
 	has_active_run() { \
-	  af dags list-runs -d transactions_pipeline -o json 2>/dev/null \
+	  af dags list-runs -d $$1 -o json 2>/dev/null \
 	    | python3 -c "import sys,json; rs=json.load(sys.stdin) or []; sys.exit(0 if any(r.get('state') in ('queued','running') for r in rs) else 1)"; \
 	}; \
 	echo ">>> bootstrap: проверяю состояние pipeline..."; \
 	if count_positive hudi.gold.transactions_by_hour; then \
 	  echo "    gold наполнен — skip"; exit 0; \
 	fi; \
-	if has_active_run; then \
-	  echo "    активный DAGRun уже есть (создан scheduler'ом) — жду без manual trigger"; \
-	else \
-	  echo "    активного DAGRun нет — триггерю manual run..."; \
-	  af dags trigger transactions_pipeline >/dev/null 2>&1 || true; \
-	fi; \
-	echo ">>> жду первый success DAGRun (до 25 мин: cold start Spark + bronze sensor + dbt silver/gold/test)..."; \
-	echo "    с catchup=True scheduler гонит ~30 catchup-runs последовательно — ждём ЛЮБОЙ success, не последний"; \
-	for i in $$(seq 1 150); do \
-	  sleep 10; \
-	  if any_run_success; then \
-	    echo "    DAGRun success получен (попытка $$i/150) — gold наполнен, можно поднимать Superset"; exit 0; \
+	for dag in bronze_s3_ingest transactions_medallion; do \
+	  if has_active_run $$dag; then \
+	    echo "    $$dag: активный DAGRun есть — без manual trigger"; \
+	  else \
+	    echo "    $$dag: активного DAGRun нет — триггерю manual run..."; \
+	    af dags trigger $$dag >/dev/null 2>&1 || true; \
 	  fi; \
-	  if any_run_failed; then \
-	    echo "ERR: один из DAGRun-ов упал — проверь airflow UI: dag transactions_pipeline"; exit 1; \
-	  fi; \
-	  if [ $$((i % 6)) = 0 ]; then echo "    жду первый success... ($$i/150, ~$$((i / 6)) мин)"; fi; \
 	done; \
-	echo "ERR: ни один DAGRun не завершился успешно за 25 мин — посмотри SparkApplication bronze-s3-streaming, DAG transactions_pipeline"; exit 1
+	echo ">>> жду наполнения gold + успешного dbt_test (до 30 мин: bronze ingest + dbt silver/gold/test)..."; \
+	for i in $$(seq 1 180); do \
+	  sleep 10; \
+	  if any_run_failed bronze_s3_ingest; then \
+	    echo "ERR: DAGRun bronze_s3_ingest упал — медальон без bronze не поедет, проверь airflow UI"; exit 1; \
+	  fi; \
+	  if any_run_failed transactions_medallion; then \
+	    echo "ERR: DAGRun transactions_medallion упал — проверь airflow UI"; exit 1; \
+	  fi; \
+	  if count_positive hudi.gold.transactions_by_hour \
+	     && count_positive hudi.gold.revenue_daily; then \
+	    echo "    gold наполнен (попытка $$i/180) — поднимаю Superset"; exit 0; \
+	  fi; \
+	  if [ $$((i % 6)) = 0 ]; then echo "    жду gold... ($$i/180, ~$$((i / 6)) мин)"; fi; \
+	done; \
+	echo "ERR: gold не наполнился за 30 мин — посмотри DAG'и bronze_s3_ingest / transactions_medallion"; exit 1
 
 superset-init:
 	$(eval SUPERSET_POD := $(shell kubectl -n data-platform get pod -l app=superset,release=superset -o jsonpath='{.items[0].metadata.name}'))
@@ -355,51 +355,3 @@ superset-init:
 	@echo ">>> Запускаю инициализацию (REST API на localhost:8088 внутри пода)..."
 	kubectl -n data-platform exec $(SUPERSET_POD) -c superset -- python /tmp/init_dashboards.py --host http://localhost:8088
 
-reset-cancellations:
-	@echo ">>> 1/3 Удаляю Hive table bronze.cancellations и silver.cancellations_clean..."
-	@kubectl -n data-platform exec deploy/trino-coordinator -- \
-	  trino --execute "DROP TABLE IF EXISTS hudi.bronze.cancellations" >/dev/null 2>&1 || true
-	@kubectl -n data-platform exec deploy/trino-coordinator -- \
-	  trino --execute "DROP TABLE IF EXISTS hudi.silver.cancellations_clean" >/dev/null 2>&1 || true
-	@echo ">>> 2/3 Чищу S3-данные таблиц и checkpoint cancellations-стрима..."
-	@kubectl -n storage delete pod mc-reset-cancel --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl -n storage run mc-reset-cancel \
-	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
-	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
-	  --command -- sh -c 'sleep 120' >/dev/null
-	@kubectl -n storage wait --for=condition=Ready pod/mc-reset-cancel --timeout=60s >/dev/null
-	@kubectl -n storage exec mc-reset-cancel -- sh -c '\
-	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
-	  mc rm --recursive --force m/lake/bronze/cancellations/ >/dev/null 2>&1 || true; \
-	  mc rm --recursive --force m/lake/silver/cancellations_clean/ >/dev/null 2>&1 || true; \
-	  mc rm --recursive --force m/hudi/.checkpoints/bronze-s3-stream-yc/cancellations/ >/dev/null 2>&1 || true; \
-	  echo "    очищено: bronze/cancellations, silver/cancellations_clean, ckpt cancellations"'
-	@kubectl -n storage delete pod mc-reset-cancel --wait=false >/dev/null 2>&1 || true
-	@echo ">>> 3/3 Рестартую bronze-s3-streaming чтобы перечитать всё с нуля..."
-	@kubectl -n spark-jobs delete sparkapplication bronze-s3-streaming --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
-	@echo "    Готово. Дальше:"
-	@echo "      1) Дождись, пока bronze.cancellations наполнится (~3-5 мин);"
-	@echo "      2) Прогони silver с full-refresh: dbt run --select cancellations_clean --full-refresh"
-	@echo "         (или дождись следующего DAG-run'а — incremental сам пересоздаст пустую таблицу)."
-
-reset-watermarks:
-	@echo ">>> 1/3 Удаляю Hive table bronze.ingest_watermarks..."
-	@kubectl -n data-platform exec deploy/trino-coordinator -- \
- 	  trino --execute "DROP TABLE IF EXISTS hudi.bronze.ingest_watermarks" >/dev/null 2>&1 || true
-	@echo ">>> 2/3 Чищу S3-данные таблицы..."
-	@kubectl -n storage delete pod mc-reset-wm --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl -n storage run mc-reset-wm \
- 	  --image=minio/mc:RELEASE.2024-11-21T17-21-54Z --restart=Never \
- 	  --env=MC_CONFIG_DIR=/tmp/.mc --env=HOME=/tmp \
- 	  --command -- sh -c 'sleep 60' >/dev/null
-	@kubectl -n storage wait --for=condition=Ready pod/mc-reset-wm --timeout=60s >/dev/null
-	@kubectl -n storage exec mc-reset-wm -- sh -c '\
- 	  mc alias set m http://minio.storage.svc.cluster.local minioadmin minioadmin123 >/dev/null && \
- 	  mc rm --recursive --force m/lake/bronze/ingest_watermarks/ >/dev/null 2>&1 || true; \
- 	  echo "    очищено: bronze/ingest_watermarks"'
-	@kubectl -n storage delete pod mc-reset-wm --wait=false >/dev/null 2>&1 || true
-	@echo ">>> 3/3 Рестартую bronze-s3-streaming чтобы пересоздать таблицу..."
-	@kubectl -n spark-jobs delete sparkapplication bronze-s3-streaming --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	@kubectl apply -f k8s/spark-applications/bronze-s3-streaming.yaml >/dev/null
-	@echo "    Готово. bootstrap_watermark_table создаст таблицу заново на старте."

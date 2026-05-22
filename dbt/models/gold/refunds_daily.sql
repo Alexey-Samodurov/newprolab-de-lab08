@@ -1,20 +1,17 @@
 {#
   Gold: Дневной объём refund-ов по дню отмены (`cancel_day`).
 
-  ADR (FIX_PLAN P1-2): refund-ы относятся к дню ОТМЕНЫ, а не к дню исходной
-  транзакции. Причина — daily-схема без пересчёта истории (см. P0-1):
-  отмена за tx_day=N приходит в day=N+K и не должна задним числом править
-  `revenue_daily[N]`. На дашборде показываем gross_revenue / refunds / refund_share
-  как три параллельные витрины.
+  ADR-003 (late-arriving): materialized=table — full rebuild на каждый run.
+  Late-arriving cancellation попадает в silver в день ingested_at, но
+  обновляет event_day-партицию прошлого дня. Инкрементный пересчёт только
+  за run_date затёр бы корректный исторический агрегат частичными данными.
+  Объём — одна строка на cancel_day, full rebuild дёшев.
 
   Refund сумма native — `refund_amount` из `cancellations_clean`. Конверсия
   в TGRK не делается на этом уровне: оригинальная валюта транзакции в bronze
-  cancellations отсутствует. На дашборде обычно достаточно nominal-сумм
-  по кол-ву; для TGRK-эквивалента в будущем нужно протянуть `currency`
-  из `transactions_clean` (см. P1-4 / future).
+  cancellations отсутствует.
 #}
-{{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge',
-   unique_key='cancel_day',
+{{ config(materialized='table', unique_key='cancel_day', file_format='hudi',
    options={'primaryKey': 'cancel_day', 'preCombineField': 'updated_at', 'type': 'cow'}) }}
 
 WITH src AS (
@@ -24,9 +21,6 @@ WITH src AS (
         is_refund_invalid,
         ingested_at
     FROM {{ ref('cancellations_clean') }}
-    {% if is_incremental() %}
-      WHERE event_day = {{ run_date() }}
-    {% endif %}
 )
 SELECT
     cancel_day,

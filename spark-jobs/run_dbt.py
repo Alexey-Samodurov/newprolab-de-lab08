@@ -23,10 +23,14 @@ def main() -> int:
     os.environ.setdefault("DBT_PROFILES_DIR", PROJECT_DIR)
     os.chdir(PROJECT_DIR)
 
+    from pyspark.sql import SparkSession
     from dbt.cli.main import dbtRunner
-
     from log_utils import get_logger
+
     log = get_logger(__name__)
+
+    spark = SparkSession.builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
 
     args = sys.argv[1:] or ["debug"]
     log.info("invoking dbt with args: %s", args)

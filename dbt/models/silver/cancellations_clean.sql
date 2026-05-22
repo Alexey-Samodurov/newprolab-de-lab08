@@ -8,6 +8,12 @@
   cancellation_id из разных микро-батчей с разным cancelled_ts уезжает в
   разные партиции и BLOOM (partition-scoped) их не дедупит → cross-partition
   дубли в silver. См. spark-jobs/hudi_utils.py: hudi_opts(global_index=...).
+
+  ADR-003 (late-arriving): инкремент по дню ЗАГРУЗКИ (date(ingested_at) = run_date),
+  а не по event_day. Late-arriving cancellation за event_day=ds−k попадает в
+  свой обычный daily run по дню ingested_at; Hudi GLOBAL_BLOOM перепишет
+  правильную event_day-партицию. Downstream gold cancellations_summary /
+  refunds_daily пересчитываются как materialized=table.
 #}
 {{ config(
     materialized='incremental',
@@ -39,11 +45,7 @@ WITH src AS (
         ) AS rn
     FROM {{ source('bronze', 'cancellations') }}
     {% if is_incremental() %}
-      -- daily: одна партиция за run_date. Late-arriving cancellation за
-      -- транзакцию из дня N-K попадает в свой event_day = cancelled_ts.date,
-      -- т.е. в обычный daily-прогон того дня. revenue_daily/cancellations_summary
-      -- НЕ пересчитывают tx_day задним числом (см. lab08/FIX_PLAN.md, P0-1, P1-2).
-      WHERE event_day = {{ run_date() }}
+      WHERE to_date(ingested_at) = {{ run_date() }}
     {% endif %}
 )
 SELECT
