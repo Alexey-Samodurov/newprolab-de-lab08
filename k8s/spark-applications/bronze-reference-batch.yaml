@@ -15,8 +15,8 @@ spec:
     - "--reference-path=s3a://npl-de18-lab8-data/reference/"
   deps:
     pyFiles:
+      - "local:///opt/spark/jobs/log_utils.py"
       - "local:///opt/spark/jobs/hudi_utils.py"
-      - "local:///opt/spark/jobs/watermark_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: OnFailure

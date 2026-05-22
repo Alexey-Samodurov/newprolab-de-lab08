@@ -11,9 +11,10 @@ from pyspark.sql.types import (
 )
 
 from hudi_utils import reference_hudi_opts, write_hudi
-from watermark_utils import bootstrap_watermark_table, write_watermark
+from log_utils import get_logger
 
 
+log = get_logger(__name__)
 USERS_SCHEMA = StructType([
     StructField("user_id", LongType(), True),
     StructField("user_uuid", StringType(), True),
@@ -51,53 +52,23 @@ def overwrite_reference(
     schema: StructType,
     pk: str,
     batch_id: int,
-) -> int:
-    """
-    Overwrite reference data by reading a JSON file, adding an ingestion timestamp, writing to Hudi,
-    and updating a watermark.
+) -> None:
+    """Overwrite a reference Hudi table from a JSON snapshot.
 
-    This function processes snapshot data for a specified table by reading it from a JSON file
-    into a DataFrame with the provided schema. It enriches the data by adding a timestamp column
-    indicating the ingestion time. If there are no rows in the snapshot, the operation is skipped.
-    Otherwise, it writes the enriched data to a Hudi dataset with the specified table options,
-    and updates the watermark metadata for tracking purposes.
-
-    Arguments:
-        spark (SparkSession): The active Spark session to use for reading and writing the data.
-        src_root (str): The root directory for the source data.
-        fname (str): The name of the JSON file within the source root directory to process.
-        table (str): The name of the destination table for the reference data.
-        schema (StructType): The schema to enforce when reading the JSON file.
-        pk (str): The primary key column for the Hudi dataset.
-        batch_id (int): The ID of the current batch being processed.
-
-    Returns:
-        int: The number of rows successfully written to the destination.
-
-    Raises:
-        None
+    ``insert_overwrite_table`` Hudi-операция атомарна; downstream читает
+    консистентный снэпшот сразу после коммита. ``df.count()`` не делаем
+    (это лишний полный скан), а пустой DF фильтруется внутри ``write_hudi``
+    через дешёвый ``take(1)``. Watermark-запись тоже не нужна: никто не
+    читает её для reference-таблиц.
     """
     path = f"{src_root.rstrip('/')}/{fname}"
     df = (
         spark.read.schema(schema).json(path)
         .withColumn("ingested_at", F.current_timestamp())
     )
-    rows = df.count()
-    if rows == 0:
-        print(f"[ref:{table}] WARN empty snapshot at {path}, skipping overwrite")
-        return 0
-
     opts = reference_hudi_opts(table, "bronze", pk=pk)
     write_hudi(df, opts)
-    write_watermark(
-        spark,
-        table_name=f"reference_{table}",
-        partitions=["__nonpartitioned__"],
-        rows_in_batch=rows,
-        batch_id=batch_id,
-    )
-    print(f"[ref:{table}] overwrote from {fname} rows={rows}")
-    return rows
+    log.info("ref table=%s overwrote from %s (batch_id=%s)", table, fname, batch_id)
 
 
 def main() -> int:
@@ -133,18 +104,20 @@ def main() -> int:
     whitelist = {t.strip() for t in args.tables.split(",") if t.strip()}
     selected = [s for s in SPECS if not whitelist or s[1] in whitelist]
     if not selected:
-        print(f"[main] no tables match whitelist={whitelist}", file=sys.stderr)
+        log.error("no tables match whitelist=%s", whitelist)
         return 1
 
     spark = (
         SparkSession.builder
         .appName("bronze-reference-batch")
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.sql.adaptive.enabled", "true")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
-    print(f"[main] reference_path={args.reference_path} tables={[s[1] for s in selected]} strict={args.strict}")
-
-    bootstrap_watermark_table(spark)
+    log.info("reference_path=%s tables=%s strict=%s",
+             args.reference_path, [s[1] for s in selected], args.strict)
 
     batch_id = int(time.time())
     failures: list[tuple[str, str]] = []
@@ -168,11 +141,12 @@ def main() -> int:
                         v = None
                 if v:
                     extra += f" {attr}={v!r}"
-            print(f"[ref:{table}] FAILED: type={type(exc).__name__} str={exc!s} repr={exc!r}{extra}", file=sys.stderr)
-            print(tb, file=sys.stderr)
+            log.error("ref table=%s FAILED: type=%s str=%s repr=%r%s",
+                      table, type(exc).__name__, exc, exc, extra)
+            log.error("%s", tb)
             if not args.strict:
                 if "Path does not exist" in tb or "FileNotFoundException" in tb:
-                    print(f"[ref:{table}] (no-strict) treating as missing file, continuing")
+                    log.warning("ref table=%s (no-strict) treating as missing file, continuing", table)
                     continue
             failures.append((table, str(exc) or repr(exc) or type(exc).__name__))
 
@@ -180,10 +154,10 @@ def main() -> int:
 
     if failures:
         for t, e in failures:
-            print(f"[main] failure detail [{t}]: {e}", file=sys.stderr)
-        print(f"[main] FAILED tables: {[t for t, _ in failures]}", file=sys.stderr)
+            log.error("failure detail [%s]: %s", t, e)
+        log.error("FAILED tables: %s", [t for t, _ in failures])
         return 1
-    print("[main] all reference tables overwritten successfully")
+    log.info("all reference tables overwritten successfully")
     return 0
 
 

@@ -5,11 +5,14 @@ from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 
 from hudi_utils import hudi_opts, write_hudi
-from watermark_utils import (
-    bootstrap_watermark_table,
-    extract_source_partitions_from_column,
-    write_watermark,
-)
+from hudi_commit_meta import read_latest_commit, normalize_partitions
+from log_utils import get_logger
+from watermark_utils import bootstrap_watermark_table, write_watermark
+
+
+log = get_logger(__name__)
+_HUDI_BASE = "s3a://lake/bronze"
+_LAST_INSTANT: dict[str, str | None] = {}
 
 
 EVENT_SCHEMA = StructType([
@@ -35,99 +38,85 @@ EVENT_SCHEMA = StructType([
 ])
 
 
-def process_batch(spark, batch_df, batch_id):
-    """Process a single Kafka micro-batch, routing events to Hudi bronze tables.
+def _emit_transactions_watermark(spark, batch_id: int) -> None:
+    """Watermark per Hudi-коммит для transactions (единственный consumer — Airflow).
 
-    Splits the batch by the ``_source`` field and writes transactions,
-    cancellations, and exchange-rate events to their respective Hudi tables,
-    then records watermark entries for each partition.
-
-    Args:
-        spark: Active SparkSession.
-        batch_df: DataFrame for the current micro-batch.
-        batch_id: Unique micro-batch identifier assigned by Structured Streaming.
+    Данные берём из ``.hoodie/*.commit`` (Hadoop FS, без Spark job-а),
+    никаких persist/count по микро-батчу.
     """
-    if batch_df.rdd.isEmpty():
+    table = "transactions_kafka"
+    path = f"{_HUDI_BASE}/{table}"
+    prev = _LAST_INSTANT.get(table)
+    instant, raw_parts, rows = read_latest_commit(spark, path, prev)
+    if instant is None or instant == prev or rows == 0:
         return
-    batch_df.persist()
+    _LAST_INSTANT[table] = instant
+    parts = normalize_partitions(raw_parts)
+    write_watermark(spark, "transactions", parts, rows, batch_id)
 
-    tx = (batch_df.filter(F.col("_source") == "transaction")
-          .withColumn("event_day", F.date_format(F.to_timestamp(F.from_unixtime("created_at")), "yyyy-MM-dd"))
-          .withColumn("composite_pk",
-                      F.concat_ws("|",
-                                  F.col("transaction_id").cast("string"),
-                                  F.coalesce(F.col("created_at").cast("string"), F.lit("0")),
-                                  F.coalesce(F.col("user_id").cast("string"), F.lit("0"))))
-          .withColumn("ingested_at", F.current_timestamp()))
-    tx.persist()
-    tx_count = tx.count()
-    if tx_count > 0:
-        write_hudi(tx, hudi_opts(
-            "transactions", "bronze",
-            pk="composite_pk", partition_field="event_day",
-            precombine="ingested_at", table_suffix="_kafka",
-            column_stats_cols="event_day,status,transaction_type,ingested_at",
-        ))
-        write_watermark(
-            spark, "transactions",
-            extract_source_partitions_from_column(tx, "event_day"),
-            tx_count, batch_id,
-        )
 
-    cancel = (batch_df.filter(F.col("_source") == "cancellation")
-              .withColumn("cancelled_ts", F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm"))
-              .withColumn("event_day", F.date_format("cancelled_ts", "yyyy-MM-dd"))
-              .withColumn("ingested_at", F.current_timestamp()))
-    cancel.persist()
-    cancel_count = cancel.count()
-    if cancel_count > 0:
-        write_hudi(cancel, hudi_opts(
-            "cancellations", "bronze",
-            pk="cancellation_id", partition_field="event_day",
-            precombine="ingested_at", table_suffix="_kafka",
-            column_stats_cols="event_day,reason,ingested_at",
-        ))
-        write_watermark(
-            spark, "cancellations",
-            extract_source_partitions_from_column(cancel, "event_day"),
-            cancel_count, batch_id,
-        )
+def process_batch(spark, batch_df, batch_id):
+    """Route Kafka events to bronze Hudi tables without per-source persist/count.
 
-    rates = (batch_df.filter(F.col("_source") == "exchange_rate")
-             .withColumn("ingested_at", F.current_timestamp()))
-    rates.persist()
-    rates_count = rates.count()
-    if rates_count > 0:
-        write_hudi(rates, hudi_opts(
-            "exchange_rates", "bronze",
-            pk="update_id", partition_field="",
-            precombine="timestamp", table_suffix="_kafka",
-            column_stats_cols="timestamp",
-            enable_record_index=False,
-        ))
-        write_watermark(
-            spark, "exchange_rates",
-            ["__nonpartitioned__"],
-            rates_count, batch_id,
-        )
+    Ранее каждый sub-DataFrame (tx/cancel/rates) шёл через
+    ``persist()`` + ``count()`` (полный скан) + повторный скан в write.
+    Сейчас: один проход чтения, ``write_hudi`` сам через ``take(1)``
+    отфильтровывает пустые батчи (один task вместо полного job-а),
+    Hudi дедуплицирует по recordkey+precombine.
+    """
+    tx = batch_df.filter(F.col("_source") == "transaction").select(
+        "*",
+        F.from_unixtime("created_at", "yyyy-MM-dd").alias("event_day"),
+        F.concat_ws(
+            "|",
+            F.col("transaction_id").cast("string"),
+            F.coalesce(F.col("created_at").cast("string"), F.lit("0")),
+            F.coalesce(F.col("user_id").cast("string"), F.lit("0")),
+        ).alias("composite_pk"),
+        F.current_timestamp().alias("ingested_at"),
+    )
+    write_hudi(tx, hudi_opts(
+        "transactions", "bronze",
+        pk="composite_pk", partition_field="event_day",
+        precombine="ingested_at", table_suffix="_kafka",
+    ))
+    _emit_transactions_watermark(spark, batch_id)
 
-    print(f"[batch {batch_id}] tx={tx_count} cancel={cancel_count} rates={rates_count}")
-    tx.unpersist()
-    cancel.unpersist()
-    rates.unpersist()
-    batch_df.unpersist()
+    cancel = batch_df.filter(F.col("_source") == "cancellation").select(
+        "*",
+        F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm").alias("cancelled_ts"),
+    ).select(
+        "*",
+        F.date_format("cancelled_ts", "yyyy-MM-dd").alias("event_day"),
+        F.current_timestamp().alias("ingested_at"),
+    )
+    write_hudi(cancel, hudi_opts(
+        "cancellations", "bronze",
+        pk="cancellation_id", partition_field="event_day",
+        precombine="ingested_at", table_suffix="_kafka",
+        global_index=True,
+    ))
+
+    rates = batch_df.filter(F.col("_source") == "exchange_rate").select(
+        "*",
+        F.concat_ws(
+            "|",
+            F.col("update_id").cast("string"),
+            F.coalesce(F.col("timestamp").cast("string"), F.lit("0")),
+        ).alias("rate_pk"),
+        F.current_timestamp().alias("ingested_at"),
+    )
+    write_hudi(rates, hudi_opts(
+        "exchange_rates", "bronze",
+        pk="rate_pk", partition_field="",
+        precombine="ingested_at", table_suffix="_kafka",
+        enable_record_index=False,
+    ))
+
+    log.info("batch=%s processed", batch_id)
 
 
 def main():
-    """Start the Kafka streaming ingest job and write parsed events to Hudi.
-
-    Reads Kafka bootstrap servers and topic from CLI args or environment variables,
-    parses JSON events against EVENT_SCHEMA, and routes each micro-batch through
-    process_batch to write bronze Hudi tables.
-
-    Raises:
-        RuntimeError: When KAFKA_BOOTSTRAP_SERVERS is not configured via argv or env.
-    """
     bootstrap = (sys.argv[1] if len(sys.argv) > 1
                  else os.environ.get("KAFKA_BOOTSTRAP_SERVERS"))
     topic = (sys.argv[2] if len(sys.argv) > 2
@@ -141,11 +130,18 @@ def main():
 
     spark = (SparkSession.builder
              .appName("bronze-kafka-ingest")
+             .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+             .config("spark.sql.shuffle.partitions", "8")
+             .config("spark.sql.adaptive.enabled", "true")
+             .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+             .config("spark.streaming.stopGracefullyOnShutdown", "true")
              .enableHiveSupport()
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
 
     bootstrap_watermark_table(spark)
+    instant, _, _ = read_latest_commit(spark, f"{_HUDI_BASE}/transactions_kafka", None)
+    _LAST_INSTANT["transactions_kafka"] = instant
 
     raw = (spark.readStream.format("kafka")
            .option("kafka.bootstrap.servers", bootstrap)

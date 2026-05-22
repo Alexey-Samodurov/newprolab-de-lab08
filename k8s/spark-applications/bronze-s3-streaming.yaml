@@ -12,13 +12,16 @@ spec:
   imagePullPolicy: IfNotPresent
   mainApplicationFile: "local:///opt/spark/jobs/bronze_s3_streaming.py"
   arguments:
-    - "--transactions-path=s3a://npl-de18-lab8-data/"
+    - "--transactions-path=s3a://npl-de18-lab8-data/day=*/slot=*/"
     - "--cancellations-path=s3a://npl-de18-lab8-data/cancellations/"
     - "--rates-path=s3a://npl-de18-lab8-data/exchange_rates/"
     - "--ckpt-root=s3a://checkpoints/bronze-s3-stream-yc"
   deps:
     pyFiles:
+      - "local:///opt/spark/jobs/log_utils.py"
       - "local:///opt/spark/jobs/hudi_utils.py"
+      - "local:///opt/spark/jobs/hudi_commit_meta.py"
+      - "local:///opt/spark/jobs/watermark_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: Always
@@ -45,15 +48,32 @@ spec:
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider": "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
-    "spark.sql.shuffle.partitions": "16"
+    "spark.sql.shuffle.partitions": "8"
     "spark.sql.streaming.numRecentProgressUpdates": "20"
-    "spark.dynamicAllocation.enabled": "true"
-    "spark.dynamicAllocation.shuffleTracking.enabled": "true"
-    "spark.dynamicAllocation.minExecutors": "1"
-    "spark.dynamicAllocation.maxExecutors": "3"
-    "spark.dynamicAllocation.initialExecutors": "1"
-    "spark.dynamicAllocation.executorIdleTimeout": "120s"
-    "spark.dynamicAllocation.shuffleTracking.timeout": "300s"
+    "spark.sql.adaptive.enabled": "true"
+    "spark.sql.adaptive.coalescePartitions.enabled": "true"
+    "spark.sql.adaptive.coalescePartitions.minPartitionSize": "8m"
+    "spark.sql.adaptive.advisoryPartitionSizeInBytes": "32m"
+    "spark.scheduler.mode": "FAIR"
+    "spark.sql.streaming.fileSource.log.compactInterval": "10"
+    "spark.sql.streaming.fileSource.log.cleanupDelay": "1800000"
+    "spark.sql.streaming.minBatchesToRetain": "10"
+    "spark.memory.offHeap.enabled": "true"
+    "spark.memory.offHeap.size": "512m"
+    "spark.memory.fraction": "0.5"
+    "spark.shuffle.file.buffer": "32k"
+    "spark.shuffle.spill.compress": "true"
+    "spark.rdd.compress": "true"
+    "spark.cleaner.periodicGC.interval": "30s"
+    "spark.hadoop.fs.s3a.connection.maximum": "64"
+    "spark.hadoop.fs.s3a.threads.max": "16"
+    "spark.hadoop.fs.s3a.list.version": "2"
+    "spark.hadoop.fs.s3a.experimental.input.fadvise": "sequential"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.connection.maximum": "64"
+    "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.threads.max": "16"
+    "spark.hadoop.fs.s3a.fast.upload.buffer": "disk"
+    "spark.hadoop.fs.s3a.multipart.size": "32M"
+    "spark.hadoop.fs.s3a.fast.upload.active.blocks": "2"
     "spark.metrics.namespace": "spark"
     "spark.sql.streaming.metricsEnabled": "true"
     "spark.metrics.conf.*.sink.prometheusServlet.class": "org.apache.spark.metrics.sink.PrometheusServlet"
@@ -82,10 +102,9 @@ spec:
         mountPath: /opt/spark/jobs
   executor:
     cores: 1
-    coreLimit: "1200m"
-    instances: 1
+    instances: 3
     memory: "2g"
-    memoryOverhead: "512m"
+    memoryOverhead: "1536m"
     labels:
       app: bronze-s3-streaming
     envSecretKeyRefs:

@@ -25,12 +25,15 @@ def main() -> int:
 
     from dbt.cli.main import dbtRunner
 
+    from log_utils import get_logger
+    log = get_logger(__name__)
+
     args = sys.argv[1:] or ["debug"]
-    print(f"[run_dbt] invoking dbt with args: {args}", flush=True)
+    log.info("invoking dbt with args: %s", args)
 
     res = dbtRunner().invoke(args)
     if res.exception is not None:
-        print(f"[run_dbt] dbt raised exception: {res.exception}", flush=True)
+        log.error("dbt raised exception: %s", res.exception)
         return 2
     return 0 if res.success else 1
 

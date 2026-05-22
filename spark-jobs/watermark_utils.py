@@ -1,22 +1,16 @@
 from __future__ import annotations
 
-import threading
 from datetime import datetime, timezone
 from typing import Iterable
 
-from pyspark.sql import DataFrame, Row, SparkSession, functions as F
+from pyspark.sql import Row, SparkSession
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from hudi_utils import hudi_opts, write_hudi
-
-# Serializes all writes to the single bronze.ingest_watermarks Hudi table.
-# Multiple Structured Streaming queries run their foreachBatch callbacks in
-# parallel driver threads; concurrent commits to the same (non-partitioned)
-# file group trigger HoodieWriteConflictException because Hudi's OCC +
-# SimpleConcurrentFileWritesConflictResolutionStrategy rejects any overlap.
-_WATERMARK_WRITE_LOCK = threading.Lock()
+from log_utils import get_logger
 
 
+log = get_logger(__name__)
 WATERMARK_SCHEMA = StructType([
     StructField("watermark_id", StringType(), False),
     StructField("table_name", StringType(), False),
@@ -27,71 +21,46 @@ WATERMARK_SCHEMA = StructType([
 
 _WATERMARK_TABLE = "ingest_watermarks"
 _WATERMARK_DB = "bronze"
+_BOOTSTRAPPED: set[str] = set()
 
 
 def _watermark_hudi_opts() -> dict:
-    """
-    Generates and returns options for configuring Hudi with watermark-specific settings.
+    """Cheap Hudi opts for the watermark table.
 
-    This function constructs a dictionary of Hudi options tailored for the watermark
-    table, including settings for primary key, precombine field, and column statistics.
-    Additional options specific to concurrency, locking, and cleaning policies are
-    also included.
+    Watermark — это per-partition маркер для downstream (Airflow sensor).
+    Дорогие фичи отключены:
 
-    Returns:
-        dict: A dictionary containing the Hudi configuration options.
+    * ``hoodie.metadata.enable=false`` — никаких MDT-коммитов на каждую запись.
+    * ``shuffle.parallelism=1`` — одна-две строки на коммит.
+    * ``clustering=false`` — крошечные файлы, кластеризация бессмысленна.
+
+    ``hive_sync`` остаётся включённым: таблица партиционируется по
+    ``table_name``, и при появлении новой партиции (например, первого
+    батча ``transactions`` после bootstrap) её нужно зарегистрировать в
+    HMS, иначе Trino/Airflow не увидят строки. ``meta_sync.condition.sync``
+    в ``hudi_opts`` гарантирует, что HMS дёргается только при реальных
+    изменениях схемы/партиций, а не на каждый коммит.
     """
     opts = hudi_opts(
         _WATERMARK_TABLE, _WATERMARK_DB,
         pk="watermark_id",
-        partition_field="",
+        partition_field="table_name",
         precombine="committed_at",
-        column_stats_cols="table_name,source_partition,committed_at",
+        column_stats_cols="committed_at",
         enable_record_index=False,
+        shuffle_parallelism=1,
+        enable_column_stats=False,
+        enable_hive_sync=True,
     )
     opts.update({
-        "hoodie.write.concurrency.mode": "optimistic_concurrency_control",
-        "hoodie.write.lock.provider": "org.apache.hudi.client.transaction.lock.InProcessLockProvider",
-        "hoodie.cleaner.policy.failed.writes": "LAZY",
         "hoodie.metadata.enable": "false",
         "hoodie.metadata.index.column.stats.enable": "false",
         "hoodie.clustering.inline": "false",
+        "hoodie.clustering.async.enabled": "false",
+        "hoodie.write.concurrency.mode": "single_writer",
+        "hoodie.cleaner.policy.failed.writes": "LAZY",
     })
     return opts
-
-
-def extract_source_partitions_from_column(batch_df: DataFrame, column: str) -> list[str]:
-    """
-    Extract unique partition values from a specified column in a DataFrame.
-
-    This function processes a given DataFrame column, identifies unique non-null
-    values, and formats them as partition strings in the form of `day=value`.
-    If the column does not exist or contains only null values, it defaults
-    to returning a single-element list with `__nonpartitioned__`.
-
-    Parameters:
-    column : str
-        The name of the column to extract partition values from.
-
-    batch_df : DataFrame
-        The input DataFrame to process for partition extraction.
-
-    Returns:
-    list[str]
-        A sorted list of partition strings derived from the specified column.
-        If the column is not present in the DataFrame or no partitions are
-        found, a default value of `["__nonpartitioned__"]` is returned.
-    """
-    if column not in batch_df.columns:
-        return ["__nonpartitioned__"]
-    rows = (
-        batch_df.select(F.col(column).alias("d"))
-        .where(F.col("d").isNotNull())
-        .distinct()
-        .collect()
-    )
-    parts = {f"day={r.d}" for r in rows if r.d}
-    return sorted(parts) if parts else ["__nonpartitioned__"]
 
 
 def write_watermark(
@@ -101,23 +70,12 @@ def write_watermark(
     rows_in_batch: int,
     batch_id: int,
 ) -> None:
-    """
-    Writes watermark information for processed partitions into a target table using Apache Hudi.
+    """Emit one watermark row per partition for downstream (Airflow) gating.
 
-    This function constructs watermark records for the given table and list of partitions,
-    then writes them to the corresponding destination using a standardized schema. Each
-    watermark record contains details such as the table name, source partition, number
-    of rows in the batch, and the committed timestamp.
-
-    Parameters:
-        spark (SparkSession): Spark session used to create DataFrames and perform write operations.
-        table_name (str): Name of the target table for which the watermark is being written.
-        partitions (Iterable[str]): List of source partition identifiers to include in the watermark data.
-        rows_in_batch (int): Number of rows processed in the current batch.
-        batch_id (int): Unique identifier of the current batch being processed.
-
-    Returns:
-        None
+    Использует Hudi с минимальной обвязкой (см. ``_watermark_hudi_opts``).
+    Поле ``rows_in_batch`` нужно только как «> 0 → есть данные»; точное
+    значение приходит из Hudi commit-метаданных (``read_latest_commit``) и
+    дополнительный count по DataFrame не запускается.
     """
     parts = list(partitions)
     if not parts:
@@ -134,28 +92,30 @@ def write_watermark(
         for p in parts
     ]
     df = spark.createDataFrame(rows, schema=WATERMARK_SCHEMA)
-    with _WATERMARK_WRITE_LOCK:
-        write_hudi(df, _watermark_hudi_opts())
-    print(f"[watermark:{table_name} batch={batch_id}] partitions={parts}")
+    write_hudi(df, _watermark_hudi_opts())
+    log.info("watermark table=%s batch=%s partitions=%s", table_name, batch_id, parts)
 
 
 def bootstrap_watermark_table(spark: SparkSession) -> None:
+    """Создать таблицу bronze.ingest_watermarks один раз за жизнь процесса.
+
+    Раньше функция писала sentinel-строку при каждом старте → Hudi commit +
+    Hive sync. Теперь: проверяем существование через HMS, и только если
+    таблицы нет — создаём её одним bootstrap-коммитом с включённым
+    hive_sync. Повторные вызовы внутри одного процесса — no-op.
     """
-    Ensures the initialization of the watermark table.
-
-    This function creates the schema for the watermark table if it does not
-    already exist, and inserts an initial sentinel record to bootstrap the
-    watermark tracking system. It guarantees that the bronze.ingest_watermarks
-    table is in place for further usage.
-
-    Arguments:
-        spark: A SparkSession instance used to execute SQL commands and create
-        the initial DataFrame.
-
-    Returns:
-        None
-    """
+    if _WATERMARK_TABLE in _BOOTSTRAPPED:
+        return
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_WATERMARK_DB}")
+    full_name = f"{_WATERMARK_DB}.{_WATERMARK_TABLE}"
+    try:
+        if spark.catalog.tableExists(full_name):
+            _BOOTSTRAPPED.add(_WATERMARK_TABLE)
+            log.info("bootstrap: %s already exists, skip", full_name)
+            return
+    except Exception:
+        pass
+
     sentinel = spark.createDataFrame(
         [Row(
             watermark_id="__bootstrap__|__init__",
@@ -167,4 +127,5 @@ def bootstrap_watermark_table(spark: SparkSession) -> None:
         schema=WATERMARK_SCHEMA,
     )
     write_hudi(sentinel, _watermark_hudi_opts())
-    print("[bootstrap] bronze.ingest_watermarks ensured")
+    _BOOTSTRAPPED.add(_WATERMARK_TABLE)
+    log.info("bootstrap: %s created", full_name)

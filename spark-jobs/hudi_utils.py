@@ -15,6 +15,9 @@ def hudi_opts(
     cluster_sort_cols: str | None = None,
     enable_record_index: bool = True,
     global_index: bool = False,
+    shuffle_parallelism: int = 4,
+    enable_column_stats: bool = False,
+    enable_hive_sync: bool = True,
 ) -> dict:
     """Build Hudi writer options for a CoW table with HMS sync.
 
@@ -65,9 +68,12 @@ def hudi_opts(
         "hoodie.datasource.write.partitionpath.field": partition_field or "",
         "hoodie.datasource.write.hive_style_partitioning": "true",
         "hoodie.datasource.write.operation": "upsert",
-        "hoodie.upsert.shuffle.parallelism": "16",
-        "hoodie.insert.shuffle.parallelism": "16",
-        "hoodie.datasource.hive_sync.enable": "true",
+        "hoodie.upsert.shuffle.parallelism": str(shuffle_parallelism),
+        "hoodie.insert.shuffle.parallelism": str(shuffle_parallelism),
+        "hoodie.bulkinsert.shuffle.parallelism": str(shuffle_parallelism),
+        "hoodie.delete.shuffle.parallelism": str(shuffle_parallelism),
+        "hoodie.datasource.hive_sync.enable": "true" if enable_hive_sync else "false",
+        "hoodie.datasource.meta_sync.condition.sync": "true",
         "hoodie.datasource.hive_sync.mode": "hms",
         "hoodie.datasource.hive_sync.database": db,
         "hoodie.datasource.hive_sync.table": full_table,
@@ -89,7 +95,7 @@ def hudi_opts(
         "hoodie.keep.min.commits": "20",
         "hoodie.keep.max.commits": "30",
         "hoodie.clustering.inline": "false",
-        "hoodie.clustering.async.enabled": "true",
+        "hoodie.clustering.async.enabled": "false",
         "hoodie.clustering.async.max.commits": "4",
         "hoodie.write.concurrency.mode": "optimistic_concurrency_control",
         "hoodie.write.lock.provider": "org.apache.hudi.client.transaction.lock.InProcessLockProvider",
@@ -98,9 +104,11 @@ def hudi_opts(
         "hoodie.clustering.plan.strategy.small.file.limit": str(100 * 1024 * 1024),
         "hoodie.clustering.plan.strategy.sort.columns": cluster_sort_cols,
         "hoodie.metadata.enable": "true",
-        "hoodie.metadata.index.column.stats.enable": "true",
-        "hoodie.metadata.index.column.stats.column.list": column_stats_cols,
+        "hoodie.metadata.compact.max.delta.commits": "20",
+        "hoodie.metadata.index.column.stats.enable": "true" if enable_column_stats else "false",
     }
+    if enable_column_stats:
+        opts["hoodie.metadata.index.column.stats.column.list"] = column_stats_cols
 
     if global_index:
         opts["hoodie.index.type"] = "GLOBAL_BLOOM"
@@ -115,8 +123,13 @@ def hudi_opts(
 
 
 def write_hudi(df: DataFrame, opts: dict) -> None:
-    """Append-mode upsert; no-op for empty batches (avoid empty-commit churn)."""
-    if df.rdd.isEmpty():
+    """Append-mode upsert; no-op for empty batches (avoid empty-commit churn).
+
+    ``df.take(1)`` дешевле, чем ``df.rdd.isEmpty()``: запускает один task
+    на одной партиции и сразу останавливается, тогда как ``isEmpty`` через
+    RDD триггерит полноценный Spark job на каждый микро-батч.
+    """
+    if not df.take(1):
         return
     w = df.write.format("hudi")
     for k, v in opts.items():
@@ -148,6 +161,7 @@ def reference_hudi_opts(table: str, db: str, pk: str) -> dict:
         precombine="ingested_at",
         column_stats_cols="ingested_at",
         enable_record_index=False,
+        shuffle_parallelism=2,
     )
     opts["hoodie.datasource.write.operation"] = "insert_overwrite_table"
     return opts

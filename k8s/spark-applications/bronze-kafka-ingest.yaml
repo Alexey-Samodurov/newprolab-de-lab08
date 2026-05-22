@@ -14,7 +14,10 @@ spec:
   arguments: []
   deps:
     pyFiles:
+      - "local:///opt/spark/jobs/log_utils.py"
       - "local:///opt/spark/jobs/hudi_utils.py"
+      - "local:///opt/spark/jobs/hudi_commit_meta.py"
+      - "local:///opt/spark/jobs/watermark_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: Always
@@ -38,6 +41,16 @@ spec:
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
+    "spark.sql.shuffle.partitions": "8"
+    "spark.sql.adaptive.enabled": "true"
+    "spark.sql.adaptive.coalescePartitions.enabled": "true"
+    "spark.memory.offHeap.enabled": "true"
+    "spark.memory.offHeap.size": "384m"
+    "spark.memory.fraction": "0.5"
+    "spark.cleaner.periodicGC.interval": "30s"
+    "spark.hadoop.fs.s3a.connection.maximum": "32"
+    "spark.hadoop.fs.s3a.threads.max": "16"
+    "spark.hadoop.fs.s3a.fast.upload.buffer": "disk"
     "spark.dynamicAllocation.enabled": "true"
     "spark.dynamicAllocation.shuffleTracking.enabled": "true"
     "spark.dynamicAllocation.minExecutors": "1"
@@ -81,8 +94,8 @@ spec:
     cores: 1
     coreLimit: "1200m"
     instances: 1
-    memory: "1g"
-    memoryOverhead: "256m"
+    memory: "2g"
+    memoryOverhead: "1g"
     labels:
       app: bronze-kafka-ingest
     envSecretKeyRefs:

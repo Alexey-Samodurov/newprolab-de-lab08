@@ -35,12 +35,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
 import time
 import uuid
 from typing import Any
 
 import requests
+
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger(__name__)
 
 
 
@@ -105,7 +116,7 @@ class SupersetClient:
             requests.HTTPError: If the response status indicates failure.
         """
         if not r.ok:
-            print(f"  ERROR {r.status_code} {r.request.method} {r.url}: {r.text[:400]}", file=sys.stderr)
+            log.error("%s %s %s: %s", r.status_code, r.request.method, r.url, r.text[:400])
             r.raise_for_status()
         return r
 
@@ -130,7 +141,8 @@ class SupersetClient:
             if r.status_code != 429:
                 return r
             wait = float(r.headers.get("Retry-After", backoff))
-            print(f"  429 rate-limited on {method} {path}; sleep {wait:.1f}s (attempt {attempt + 1}/6)")
+            log.warning("429 rate-limited on %s %s; sleep %.1fs (attempt %d/6)",
+                        method, path, wait, attempt + 1)
             time.sleep(wait)
             backoff = min(backoff * 2, 16.0)
         return r
@@ -225,11 +237,11 @@ def upsert_database(client: SupersetClient) -> int:
     }
     existing = client.find_id("/api/v1/database/", "database_name", name)
     if existing:
-        print(f"  Database '{name}' exists (id={existing}) — updating connection.")
+        log.info("Database '%s' exists (id=%s) — updating connection.", name, existing)
         client.put(f"/api/v1/database/{existing}", payload)
         return existing
     db_id = client.post("/api/v1/database/", payload)["id"]
-    print(f"  Created database id={db_id}")
+    log.info("Created database id=%s", db_id)
     return db_id
 
 
@@ -238,20 +250,20 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
     existing = client.find_id("/api/v1/dataset/", "table_name", table)
     if existing:
         ds_id = existing
-        print(f"  Dataset '{GOLD_SCHEMA}.{table}' exists (id={ds_id}).")
+        log.info("Dataset '%s.%s' exists (id=%s).", GOLD_SCHEMA, table, ds_id)
     else:
         r = client.session.post(
             f"{client.host}/api/v1/dataset/",
             json={"database": db_id, "schema": GOLD_SCHEMA, "table_name": table},
         )
         if r.status_code == 422 and "could not be found" in r.text:
-            print(f"  Dataset '{GOLD_SCHEMA}.{table}': таблица ещё не создана в Trino — skip.")
+            log.warning("Dataset '%s.%s': таблица ещё не создана в Trino — skip.", GOLD_SCHEMA, table)
             return None
         if not r.ok:
-            print(f"  ERROR {r.status_code}: {r.text[:300]}", file=sys.stderr)
+            log.error("%s: %s", r.status_code, r.text[:300])
             r.raise_for_status()
         ds_id = r.json()["id"]
-        print(f"  Created dataset '{GOLD_SCHEMA}.{table}' id={ds_id}")
+        log.info("Created dataset '%s.%s' id=%s", GOLD_SCHEMA, table, ds_id)
         time.sleep(0.5)
 
     dttm = DATASET_MAIN_DTTM.get(table)
@@ -280,9 +292,9 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
                 "main_dttm_col": dttm,
                 "columns": updated_cols,
             })
-            print(f"    main_dttm_col={dttm}")
+            log.info("main_dttm_col=%s", dttm)
         else:
-            print(f"    WARN: колонка '{dttm}' не найдена в датасете {table}, time-series viz не сработает")
+            log.warning("колонка '%s' не найдена в датасете %s, time-series viz не сработает", dttm, table)
     return ds_id
 
 
@@ -290,7 +302,7 @@ def upsert_dataset(client: SupersetClient, db_id: int, table: str) -> int | None
 def upsert_chart(client: SupersetClient, payload: dict) -> int | None:
     """Идемпотентный upsert: PUT по id если есть, иначе POST."""
     if payload.get("datasource_id") is None:
-        print(f"  Chart '{payload['slice_name']}': skip (нет датасета)")
+        log.warning("Chart '%s': skip (нет датасета)", payload['slice_name'])
         return None
     existing = client.find_id("/api/v1/chart/", "slice_name", payload["slice_name"])
     if existing:
@@ -299,10 +311,10 @@ def upsert_chart(client: SupersetClient, payload: dict) -> int | None:
             if k in {"slice_name", "description", "viz_type", "params"}
         }
         client.put(f"/api/v1/chart/{existing}", update_payload)
-        print(f"  Updated chart '{payload['slice_name']}' id={existing}")
+        log.info("Updated chart '%s' id=%s", payload['slice_name'], existing)
         return existing
     chart_id = client.post("/api/v1/chart/", payload)["id"]
-    print(f"  Created chart '{payload['slice_name']}' id={chart_id}")
+    log.info("Created chart '%s' id=%s", payload['slice_name'], chart_id)
     return chart_id
 
 
@@ -324,7 +336,7 @@ def cleanup_obsolete_charts(client: SupersetClient) -> None:
         sid = client.find_id("/api/v1/chart/", "slice_name", stale)
         if sid:
             client.delete(f"/api/v1/chart/{sid}")
-            print(f"  Removed obsolete chart '{stale}' (id={sid})")
+            log.info("Removed obsolete chart '%s' (id=%s)", stale, sid)
 
 
 
@@ -869,28 +881,28 @@ def upsert_dashboard(
     if existing:
         dash_id = existing
         client.put(f"/api/v1/dashboard/{dash_id}", payload)
-        print(f"  Updated dashboard '{title}' id={dash_id}")
+        log.info("Updated dashboard '%s' id=%s", title, dash_id)
     else:
         dash_id = client.post("/api/v1/dashboard/", payload)["id"]
-        print(f"  Created dashboard '{title}' id={dash_id}")
+        log.info("Created dashboard '%s' id=%s", title, dash_id)
 
     for cid_ in valid_charts.values():
         client.put(f"/api/v1/chart/{cid_}", {"dashboards": [dash_id]})
         time.sleep(0.4)
-    print(f"  Linked {len(valid_charts)} charts to dashboard id={dash_id}")
+    log.info("Linked %d charts to dashboard id=%s", len(valid_charts), dash_id)
     return dash_id
 
 
 
 def main() -> None:
     args = parse_args()
-    print(f"Connecting to Superset at {args.host} as {args.user}...")
+    log.info("Connecting to Superset at %s as %s...", args.host, args.user)
     client = SupersetClient(args.host, args.user, args.password)
 
-    print("\n[1/4] Database connection...")
+    log.info("[1/4] Database connection...")
     db_id = upsert_database(client)
 
-    print("\n[2/4] Datasets...")
+    log.info("[2/4] Datasets...")
     tables = [
         "transactions_by_hour",
         "purchases_by_hour",
@@ -904,17 +916,17 @@ def main() -> None:
     ]
     ds = {t: upsert_dataset(client, db_id, t) for t in tables}
 
-    print("\n[3/4] Charts...")
+    log.info("[3/4] Charts...")
     cleanup_obsolete_charts(client)
     charts = build_charts(client, ds)
 
-    print("\n[4/4] Dashboard...")
+    log.info("[4/4] Dashboard...")
     if not any(charts.values()):
-        print("  Нет ни одного чарта (gold таблицы пока пусты). Запусти DAG transactions_pipeline и повтори.")
+        log.warning("Нет ни одного чарта (gold таблицы пока пусты). Запусти DAG transactions_pipeline и повтори.")
         return
     upsert_dashboard(client, "Lab08 — Transaction Analytics", charts, ds)
 
-    print("\nDone! Open Superset → Dashboards → 'Lab08 — Transaction Analytics'.")
+    log.info("Done! Open Superset → Dashboards → 'Lab08 — Transaction Analytics'.")
 
 
 if __name__ == "__main__":
