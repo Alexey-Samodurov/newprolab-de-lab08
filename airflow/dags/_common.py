@@ -48,8 +48,8 @@ SPARK_CONF: dict[str, str] = {
     "spark.dynamicAllocation.enabled": "true",
     "spark.dynamicAllocation.shuffleTracking.enabled": "true",
     "spark.dynamicAllocation.minExecutors": "1",
-    "spark.dynamicAllocation.maxExecutors": "3",
-    "spark.dynamicAllocation.initialExecutors": "1",
+    "spark.dynamicAllocation.maxExecutors": "2",
+    "spark.dynamicAllocation.initialExecutors": "2",
     "spark.dynamicAllocation.executorIdleTimeout": "60s",
     "spark.dynamicAllocation.shuffleTracking.timeout": "120s",
 }

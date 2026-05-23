@@ -22,8 +22,11 @@ sources:
           - name: event_day
       - name: cancellations
         columns:
-          - name: cancellation_id
+          - name: cancellation_pk
+            description: "event_day|cancellation_id — глобально-уникальный ключ. Сам cancellation_id рестартует с 1 в каждом дневном файле, поэтому используется только в составе pk."
             tests: [not_null, unique]
+          - name: cancellation_id
+            tests: [not_null]
           - name: original_transaction_id
           - name: refund_amount
           - name: cancelled_ts

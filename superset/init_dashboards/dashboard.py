@@ -253,7 +253,6 @@ def upsert_dashboard(
         if n in {
             "KPI: Total Transactions",
             "Daily Transactions by Status",
-            "Transactions by Hour",
         }
     ]
     charts_without_time = [

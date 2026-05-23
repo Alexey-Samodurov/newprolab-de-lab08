@@ -85,13 +85,30 @@ class SourceSpec:
     table: str
     schema: StructType
     path_template: str
-    prepare: Callable[[DataFrame], DataFrame]
+    prepare: Callable[[DataFrame, str], DataFrame]
     hudi_options: Callable[[], dict]
     emits_watermark: bool
     read_options: dict = field(default_factory=dict)
 
 
-def _prepare_transactions(df: DataFrame) -> DataFrame:
+def _ingested_at(ds: str):
+    """Return a literal timestamp column representing the ingestion day.
+
+    The bronze layer stamps every row with the logical date of the Airflow
+    run that produced it. That makes backfills deterministic and keeps the
+    downstream ``to_date(ingested_at) = run_date()`` filter (used for
+    late-arriving cancellations) correct regardless of wall-clock skew.
+
+    Args:
+        ds: Airflow logical date in ``YYYY-MM-DD`` form.
+
+    Returns:
+        Spark column expression of type ``timestamp``.
+    """
+    return F.to_timestamp(F.lit(ds))
+
+
+def _prepare_transactions(df: DataFrame, ds: str) -> DataFrame:
     """Add ``event_day``, ``composite_pk`` and ``ingested_at`` to transactions."""
     return df.select(
         "*",
@@ -102,23 +119,60 @@ def _prepare_transactions(df: DataFrame) -> DataFrame:
             F.coalesce(F.col("created_at").cast("string"), F.lit("0")),
             F.coalesce(F.col("user_id").cast("string"), F.lit("0")),
         ).alias("composite_pk"),
-        F.current_timestamp().alias("ingested_at"),
+        _ingested_at(ds).alias("ingested_at"),
     )
 
 
-def _prepare_cancellations(df: DataFrame) -> DataFrame:
-    """Parse ``cancelled_at`` and derive ``event_day`` / ``ingested_at``."""
-    return df.select(
+def _prepare_cancellations(df: DataFrame, ds: str) -> DataFrame:
+    """Parse ``cancelled_at``, derive ``event_day`` / ``ingested_at`` and
+    build a globally-unique ``cancellation_pk``.
+
+    Upstream ``cancellation_id`` is only unique within a single daily file
+    (it restarts from ``1`` every day), so it cannot be used as a Hudi
+    record key. ``cancellation_pk`` is composed of the raw ``cancelled_at``
+    string and the source file day (``src_day = ds``) plus the id; that
+    keeps the key unique even when:
+
+    * ``cancelled_at`` cannot be parsed (``cancelled_ts is NULL``) — the
+      raw string still participates in the key;
+    * the same numeric ``cancellation_id`` lands in two different daily
+      files because per-file numbering restarts — ``src_day`` (file day)
+      disambiguates them while ``event_day`` (derived from
+      ``cancelled_ts``) is the partition that keeps late-arriving
+      records grouped by their actual cancel day.
+
+    ``event_day`` is the parsed cancel date, falling back to the file
+    day when the timestamp cannot be parsed; this ensures partition
+    keys are never ``NULL``.
+    """
+    parsed = df.select(
         "*",
         F.to_timestamp("cancelled_at", "yyyy MMM dd HH:mm").alias("cancelled_ts"),
-    ).select(
-        "*",
-        F.date_format("cancelled_ts", "yyyy-MM-dd").alias("event_day"),
-        F.current_timestamp().alias("ingested_at"),
+    )
+    return (
+        parsed
+        .withColumn(
+            "event_day",
+            F.coalesce(
+                F.date_format("cancelled_ts", "yyyy-MM-dd"),
+                F.lit(ds),
+            ),
+        )
+        .withColumn("ingested_at", _ingested_at(ds))
+        .withColumn("src_day", F.lit(ds))
+        .withColumn(
+            "cancellation_pk",
+            F.concat_ws(
+                "|",
+                F.lit(ds),
+                F.coalesce(F.col("cancelled_at"), F.lit("__nullts__")),
+                F.coalesce(F.col("cancellation_id").cast("string"), F.lit("__nullid__")),
+            ),
+        )
     )
 
 
-def _prepare_rates(df: DataFrame) -> DataFrame:
+def _prepare_rates(df: DataFrame, ds: str) -> DataFrame:
     """Build composite ``rate_pk`` so re-sent updates keep history."""
     return df.select(
         "*",
@@ -127,7 +181,7 @@ def _prepare_rates(df: DataFrame) -> DataFrame:
             F.col("update_id").cast("string"),
             F.coalesce(F.col("timestamp").cast("string"), F.lit("0")),
         ).alias("rate_pk"),
-        F.current_timestamp().alias("ingested_at"),
+        _ingested_at(ds).alias("ingested_at"),
     )
 
 
@@ -143,10 +197,9 @@ def _tx_opts() -> dict:
 def _cancel_opts() -> dict:
     return hudi_opts(
         _SOURCE_CANCELLATIONS, "bronze",
-        pk="cancellation_id",
+        pk="cancellation_pk",
         partition_field="event_day",
         precombine="ingested_at",
-        global_index=True,
     )
 
 
@@ -254,7 +307,7 @@ def ingest(spark: SparkSession, spec: SourceSpec, ds: str, src_root: str) -> int
             _emit_watermark(spark, spec, ds, rows=0)
         return 0
 
-    prepared = spec.prepare(raw)
+    prepared = spec.prepare(raw, ds)
     write_hudi(prepared, spec.hudi_options())
     log.info("source=%s ds=%s rows=%s upserted", spec.name, ds, rows)
 

@@ -35,8 +35,11 @@ models:
 
   - name: cancellations_clean
     columns:
-      - name: cancellation_id
+      - name: cancellation_pk
+        description: "event_day|cancellation_id — глобально-уникальный ключ. Сам cancellation_id рестартует с 1 в каждом дневном файле."
         tests: [not_null, unique]
+      - name: cancellation_id
+        tests: [not_null]
 
   - name: exchange_rates_daily
     columns:
