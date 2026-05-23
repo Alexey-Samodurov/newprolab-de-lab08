@@ -10,8 +10,8 @@ from pyspark.sql.types import (
     BooleanType, LongType, StringType, StructField, StructType,
 )
 
-from hudi_utils import reference_hudi_opts, write_hudi
-from log_utils import get_logger
+from utils.hudi import reference_hudi_opts, write_hudi
+from utils.log import get_logger
 
 
 log = get_logger(__name__)
@@ -112,9 +112,10 @@ def main() -> int:
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.sql.shuffle.partitions", "4")
         .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.hadoop.hive.metastore.client.socket.timeout", "600s")
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel("WARN")
+    spark.sparkContext.setLogLevel("ERROR")
     log.info("reference_path=%s tables=%s strict=%s",
              args.reference_path, [s[1] for s in selected], args.strict)
 

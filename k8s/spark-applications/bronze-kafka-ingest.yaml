@@ -12,12 +12,6 @@ spec:
   imagePullPolicy: IfNotPresent
   mainApplicationFile: "local:///opt/spark/jobs/bronze_kafka_ingest.py"
   arguments: []
-  deps:
-    pyFiles:
-      - "local:///opt/spark/jobs/log_utils.py"
-      - "local:///opt/spark/jobs/hudi_utils.py"
-      - "local:///opt/spark/jobs/hudi_commit_meta.py"
-      - "local:///opt/spark/jobs/watermark_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: Always
@@ -41,6 +35,8 @@ spec:
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
+    "spark.kubernetes.driverEnv.PYTHONPATH": "/opt/spark/jobs"
+    "spark.executorEnv.PYTHONPATH": "/opt/spark/jobs"
     "spark.sql.shuffle.partitions": "8"
     "spark.sql.adaptive.enabled": "true"
     "spark.sql.adaptive.coalescePartitions.enabled": "true"
@@ -90,6 +86,8 @@ spec:
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
+      - name: spark-utils-code
+        mountPath: /opt/spark/jobs/utils
   executor:
     cores: 1
     coreLimit: "1200m"
@@ -108,7 +106,12 @@ spec:
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
+      - name: spark-utils-code
+        mountPath: /opt/spark/jobs/utils
   volumes:
     - name: jobs-code
       configMap:
         name: spark-jobs-code
+    - name: spark-utils-code
+      configMap:
+        name: spark-utils-code

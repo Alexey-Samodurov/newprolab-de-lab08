@@ -31,6 +31,9 @@ sources:
       - name: exchange_rates
         columns:
           - name: update_id
+            tests: [not_null]
+          - name: rate_pk
+            description: "update_id|timestamp — составной ключ, ревизии одного update_id сохраняются как история."
             tests: [not_null, unique]
           - name: timestamp
           - name: rate_tgrk_punk

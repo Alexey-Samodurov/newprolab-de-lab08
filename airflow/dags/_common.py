@@ -18,12 +18,6 @@ SOURCE_ROOT = f"s3a://{SOURCE_BUCKET}"
 BRONZE_SOURCES: tuple[str, ...] = ("transactions", "cancellations", "exchange_rates")
 WATERMARK_PRODUCER: str = "transactions"
 
-BRONZE_PYFILES: tuple[str, ...] = (
-    f"{JOBS_DIR}/log_utils.py",
-    f"{JOBS_DIR}/hudi_utils.py",
-    f"{JOBS_DIR}/watermark_utils.py",
-)
-
 SPARK_CONF: dict[str, str] = {
     "spark.sql.catalogImplementation": "hive",
     "spark.sql.warehouse.dir": "s3a://lake/warehouse/",
@@ -39,6 +33,8 @@ SPARK_CONF: dict[str, str] = {
     "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.EnvironmentVariableCredentialsProvider",
     "spark.kubernetes.namespace": NAMESPACE,
     "spark.kubernetes.executor.deleteOnTermination": "true",
+    "spark.kubernetes.driverEnv.PYTHONPATH": "/opt/spark/jobs",
+    "spark.executorEnv.PYTHONPATH": "/opt/spark/jobs",
     "spark.sql.shuffle.partitions": "16",
     "spark.sql.adaptive.enabled": "true",
     "spark.sql.adaptive.coalescePartitions.enabled": "true",
@@ -81,6 +77,7 @@ DRIVER_BASE: dict = {
     "envSecretKeyRefs": _AWS_ENV_REFS,
     "volumeMounts": [
         {"name": "jobs-code", "mountPath": "/opt/spark/jobs"},
+        {"name": "spark-utils-code", "mountPath": "/opt/spark/jobs/utils"},
         {"name": "dbt-cm", "mountPath": "/tmp/cm"},
     ],
 }
@@ -92,6 +89,10 @@ EXECUTOR_BASE: dict = {
     "memory": "1g",
     "memoryOverhead": "512m",
     "envSecretKeyRefs": _AWS_ENV_REFS,
+    "volumeMounts": [
+        {"name": "jobs-code", "mountPath": "/opt/spark/jobs"},
+        {"name": "spark-utils-code", "mountPath": "/opt/spark/jobs/utils"},
+    ],
 }
 
 
@@ -162,6 +163,7 @@ BRONZE_RESOURCE_PROFILES: dict[str, dict] = {
 
 VOLUMES: list[dict] = [
     {"name": "jobs-code", "configMap": {"name": "spark-jobs-code"}},
+    {"name": "spark-utils-code", "configMap": {"name": "spark-utils-code"}},
     {"name": "dbt-cm", "configMap": {"name": "dbt-project"}},
 ]
 
@@ -171,7 +173,7 @@ def build_spark_application_spec(
     name: str,
     main_file: str,
     arguments: list[str],
-    py_files: Iterable[str],
+    py_files: Iterable[str] = (),
     app_label: str,
     extra_conf: dict[str, str] | None = None,
     resource_profile: dict | None = None,
@@ -182,7 +184,10 @@ def build_spark_application_spec(
         name: Metadata name (a ``ts_nodash`` suffix is appended).
         main_file: ``local://`` path to the entry Python file.
         arguments: CLI args passed to the main file.
-        py_files: Auxiliary Python files mounted as ``deps.pyFiles``.
+        py_files: Optional auxiliary Python files mounted as
+            ``deps.pyFiles``. Empty by default since shared utilities live
+            in the ``spark-utils-code`` ConfigMap volume mounted as the
+            ``utils`` Python package.
         app_label: Label applied to driver and executor pods.
         extra_conf: Optional Spark conf overrides merged on top of
             ``SPARK_CONF``.
@@ -198,6 +203,31 @@ def build_spark_application_spec(
     spark_conf = {**SPARK_CONF, **(extra_conf or {}), **profile.get("conf", {})}
     driver = {**DRIVER_BASE, **profile.get("driver", {}), "labels": {"app": app_label}}
     executor = {**EXECUTOR_BASE, **profile.get("executor", {}), "labels": {"app": app_label}}
+    spec: dict = {
+        "type": "Python",
+        "pythonVersion": "3",
+        "mode": "cluster",
+        "image": SPARK_IMAGE,
+        "imagePullPolicy": "IfNotPresent",
+        "mainApplicationFile": main_file,
+        "arguments": arguments,
+        "sparkVersion": "3.5.8",
+        "restartPolicy": {
+            "type": "OnFailure",
+            "onFailureRetries": 2,
+            "onFailureRetryInterval": 30,
+            "onSubmissionFailureRetries": 3,
+            "onSubmissionFailureRetryInterval": 30,
+        },
+        "timeToLiveSeconds": 600,
+        "sparkConf": spark_conf,
+        "driver": driver,
+        "executor": executor,
+        "volumes": VOLUMES,
+    }
+    py_files_list = list(py_files)
+    if py_files_list:
+        spec["deps"] = {"pyFiles": py_files_list}
     return {
         "apiVersion": "sparkoperator.k8s.io/v1beta2",
         "kind": "SparkApplication",
@@ -205,29 +235,7 @@ def build_spark_application_spec(
             "name": f"{name}-" + "{{ ts_nodash | lower }}",
             "namespace": NAMESPACE,
         },
-        "spec": {
-            "type": "Python",
-            "pythonVersion": "3",
-            "mode": "cluster",
-            "image": SPARK_IMAGE,
-            "imagePullPolicy": "IfNotPresent",
-            "mainApplicationFile": main_file,
-            "arguments": arguments,
-            "deps": {"pyFiles": list(py_files)},
-            "sparkVersion": "3.5.8",
-            "restartPolicy": {
-                "type": "OnFailure",
-                "onFailureRetries": 2,
-                "onFailureRetryInterval": 30,
-                "onSubmissionFailureRetries": 3,
-                "onSubmissionFailureRetryInterval": 30,
-            },
-            "timeToLiveSeconds": 600,
-            "sparkConf": spark_conf,
-            "driver": driver,
-            "executor": executor,
-            "volumes": VOLUMES,
-        },
+        "spec": spec,
     }
 
 

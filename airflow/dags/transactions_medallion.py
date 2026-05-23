@@ -103,7 +103,7 @@ with DAG(
         python_callable=_bronze_ready,
         mode="reschedule",
         poke_interval=60,
-        timeout=60 * 60 * 4,
+        timeout=350,
         soft_fail=False,
     )
 

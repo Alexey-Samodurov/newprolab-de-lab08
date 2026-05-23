@@ -22,7 +22,7 @@ help:
 	@echo "  make reference-batch          - применить (или перезапустить) one-shot bronze-reference-batch SparkApplication"
 	@echo "  make kafka-streaming-app      - применить bronze-kafka-ingest SparkApplication (speed layer, опционально)"
 	@echo "  make ensure-buckets           - убедиться что lake bucket существует (для существующего MinIO)"
-	@echo "  make spark-code               - пересоздать ConfigMap spark-jobs-code из spark-jobs/*.py"
+	@echo "  make spark-code               - пересоздать ConfigMap'ы spark-jobs-code и spark-utils-code"
 	@echo "  make dbt-configmap            - пересоздать ConfigMap dbt-project из dbt/"
 	@echo "  make ingress                  - применить Ingress-ресурсы (airflow/superset/trino/minio)"
 	@echo "  make monitoring               - применить ServiceMonitor/PodMonitor + Grafana dashboards"
@@ -175,7 +175,10 @@ down:
 
 spark-code:
 	kubectl create configmap spark-jobs-code -n spark-jobs \
-	  --from-file=spark-jobs/ \
+	  --from-file=spark/jobs/ \
+	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	kubectl create configmap spark-utils-code -n spark-jobs \
+	  --from-file=spark/utils/ \
 	  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 dbt-configmap:
@@ -350,8 +353,9 @@ superset-init:
 	@test -n "$(SUPERSET_POD)" || (echo "Superset pod не найден" && exit 1)
 	@echo ">>> Жду готовности Superset..."
 	@kubectl -n data-platform wait --for=condition=ready pod/$(SUPERSET_POD) --timeout=300s
-	@echo ">>> Копирую init_dashboards.py в pod $(SUPERSET_POD)..."
-	kubectl -n data-platform cp superset/init_dashboards.py $(SUPERSET_POD):/tmp/init_dashboards.py -c superset
+	@echo ">>> Копирую пакет init_dashboards в pod $(SUPERSET_POD)..."
+	kubectl -n data-platform exec $(SUPERSET_POD) -c superset -- rm -rf /tmp/init_dashboards
+	kubectl -n data-platform cp superset/init_dashboards $(SUPERSET_POD):/tmp/init_dashboards -c superset
 	@echo ">>> Запускаю инициализацию (REST API на localhost:8088 внутри пода)..."
-	kubectl -n data-platform exec $(SUPERSET_POD) -c superset -- python /tmp/init_dashboards.py --host http://localhost:8088
+	kubectl -n data-platform exec $(SUPERSET_POD) -c superset -- sh -c 'cd /tmp && python -m init_dashboards --host http://localhost:8088'
 

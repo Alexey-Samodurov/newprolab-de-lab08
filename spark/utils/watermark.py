@@ -6,8 +6,8 @@ from typing import Iterable
 from pyspark.sql import Row, SparkSession
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
-from hudi_utils import hudi_opts, write_hudi
-from log_utils import get_logger
+from utils.hudi import hudi_opts, write_hudi
+from utils.log import get_logger
 
 
 log = get_logger(__name__)

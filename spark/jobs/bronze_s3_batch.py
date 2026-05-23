@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from pyspark.sql import DataFrame, SparkSession, functions as F
@@ -24,9 +24,9 @@ from pyspark.sql.types import (
     DoubleType, LongType, StringType, StructField, StructType,
 )
 
-from hudi_utils import hudi_opts, write_hudi
-from log_utils import get_logger
-from watermark_utils import bootstrap_watermark_table, write_watermark
+from utils.hudi import hudi_opts, write_hudi
+from utils.log import get_logger
+from utils.watermark import bootstrap_watermark_table, write_watermark
 
 
 log = get_logger(__name__)
@@ -88,6 +88,7 @@ class SourceSpec:
     prepare: Callable[[DataFrame], DataFrame]
     hudi_options: Callable[[], dict]
     emits_watermark: bool
+    read_options: dict = field(default_factory=dict)
 
 
 def _prepare_transactions(df: DataFrame) -> DataFrame:
@@ -164,10 +165,14 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
         name=_SOURCE_TRANSACTIONS,
         table=_SOURCE_TRANSACTIONS,
         schema=_TX_SCHEMA,
-        path_template="{src_root}/day={ds}/slot=*/transactions.jsonl",
+        path_template="{src_root}/day={ds}",
         prepare=_prepare_transactions,
         hudi_options=_tx_opts,
         emits_watermark=True,
+        read_options={
+            "recursiveFileLookup": "true",
+            "pathGlobFilter": "transactions.jsonl",
+        },
     ),
     _SOURCE_CANCELLATIONS: SourceSpec(
         name=_SOURCE_CANCELLATIONS,
@@ -191,11 +196,18 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
 
 
 def _path_exists(spark: SparkSession, path: str) -> bool:
-    """Probe S3 via Hadoop FS without triggering a Spark job."""
+    """Probe S3 via Hadoop FS without triggering a Spark job.
+
+    Uses cheap ``fs.exists`` for non-glob prefixes (single HEAD/LIST)
+    and falls back to ``globStatus`` only when the path actually contains
+    wildcard characters.
+    """
     jvm = spark._jvm
     hpath = jvm.org.apache.hadoop.fs.Path(path)
     fs = hpath.getFileSystem(spark._jsc.hadoopConfiguration())
-    return bool(fs.globStatus(hpath))
+    if any(ch in path for ch in "*?[{"):
+        return bool(fs.globStatus(hpath))
+    return bool(fs.exists(hpath))
 
 
 def read_day(spark: SparkSession, spec: SourceSpec, path: str) -> DataFrame:
@@ -204,7 +216,7 @@ def read_day(spark: SparkSession, spec: SourceSpec, path: str) -> DataFrame:
     Args:
         spark: Active SparkSession.
         spec: Source spec describing schema and target.
-        path: Absolute S3a glob pointing to the day's files.
+        path: Absolute S3a path (prefix or glob) pointing to the day's files.
 
     Returns:
         DataFrame with the source schema. An empty DataFrame is returned
@@ -213,7 +225,10 @@ def read_day(spark: SparkSession, spec: SourceSpec, path: str) -> DataFrame:
     if not _path_exists(spark, path):
         log.warning("source=%s path=%s does not exist, treating as empty", spec.name, path)
         return spark.createDataFrame([], spec.schema)
-    return spark.read.schema(spec.schema).json(path)
+    reader = spark.read.schema(spec.schema)
+    for key, value in spec.read_options.items():
+        reader = reader.option(key, value)
+    return reader.json(path)
 
 
 def ingest(spark: SparkSession, spec: SourceSpec, ds: str, src_root: str) -> int:
@@ -294,6 +309,14 @@ def build_spark(app_name: str) -> SparkSession:
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.sources.parallelPartitionDiscovery.parallelism", "256")
+        .config("spark.sql.sources.parallelPartitionDiscovery.threshold", "32")
+        .config("spark.hadoop.mapreduce.input.fileinputformat.list-status.num-threads", "32")
+        .config("spark.hadoop.fs.s3a.paging.maximum", "5000")
+        .config("spark.hadoop.fs.s3a.threads.max", "64")
+        .config("spark.hadoop.fs.s3a.connection.maximum", "128")
+        .config("spark.hadoop.fs.s3a.experimental.input.fadvise", "sequential")
+        .config("spark.hadoop.hive.metastore.client.socket.timeout", "600s")
         .enableHiveSupport()
         .getOrCreate()
     )
@@ -310,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     spec = SOURCE_SPECS[args.source]
 
     spark = build_spark(f"bronze-s3-batch-{spec.name}-{args.ds}")
-    spark.sparkContext.setLogLevel("WARN")
+    spark.sparkContext.setLogLevel("ERROR")
     try:
         if spec.emits_watermark:
             bootstrap_watermark_table(spark)

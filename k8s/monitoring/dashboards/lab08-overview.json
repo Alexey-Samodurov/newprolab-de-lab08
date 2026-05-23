@@ -623,7 +623,7 @@
           "type": "timeseries",
           "id": 251,
           "title": "Streaming batch latency",
-          "description": "DURATION. Spark Structured Streaming micro-batch latency (`metrics_spark_driver_spark_streaming_*_latency_Value`).\n\n• Видна только для bronze-* (streaming SparkApplication-ы).\n• Для dbt-silver/gold/test-* (batch) серий нет — эти приложения не запускают streaming queries.\n\nNB: ранее панель также показывала Hudi commit p95, но Hudi native PROMETHEUS reporter глобально выключен (`hoodie.metrics.on=false` в `spark-jobs/hudi_utils.py`) из-за несовместимости hudi-bundle 1.1.1 с simpleclient_dropwizard. Серия Hudi-таймеров пустая by design — write-progress смотри в панели «Spark write activity».",
+          "description": "DURATION. Spark Structured Streaming micro-batch latency (`metrics_spark_driver_spark_streaming_*_latency_Value`).\n\n• Видна только для bronze-* (streaming SparkApplication-ы).\n• Для dbt-silver/gold/test-* (batch) серий нет — эти приложения не запускают streaming queries.\n\nNB: ранее панель также показывала Hudi commit p95, но Hudi native PROMETHEUS reporter глобально выключен (`hoodie.metrics.on=false` в `spark/utils/hudi.py`) из-за несовместимости hudi-bundle 1.1.1 с simpleclient_dropwizard. Серия Hudi-таймеров пустая by design — write-progress смотри в панели «Spark write activity».",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

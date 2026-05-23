@@ -41,9 +41,10 @@ flowchart LR
 | Docker Desktop / kind host | ≥4 vCPU | **≥16 GB выделено Docker'у** | ≥40 GB на образы и PVC | HTTPS наружу (YC S3, Helm repo, Docker Hub), доступ к Kafka |
 | MinIO PVC | — | — | 20 Gi (1 pool × 1 server) | — |
 | HMS Postgres | 100m / 500m | 256 Mi / 512 Mi | PVC дефолтного StorageClass | — |
-| Spark driver (streaming) | 1 / 1200m | 1 Gi + 256 Mi overhead | — | — |
-| Spark executor (streaming) | 1 / 1200m | 2 Gi + 512 Mi overhead, 1–3 инстанса | — | — |
-| Spark driver / executor (dbt) | 1 / 1200m | 1 Gi / 2 Gi (+overhead) | — | — |
+| Spark driver / executor (bronze transactions) | 1 / 1200m | 1g / 1g (+256m/512m overhead), 2 executors | — | живут только на время DAGRun |
+| Spark driver / executor (bronze cancellations, exchange_rates) | 1 / 1200m | 512m / 512m (+128m/256m overhead), 1 executor | — | живут только на время DAGRun |
+| Spark driver / executor (dbt) | 1 / 1200m | 1 Gi / 2 Gi (+overhead) | — | живут только на время DAGRun |
+| Spark driver / executor (Kafka streaming, опционально) | 1 / 1200m | 1 Gi + 256 Mi / 2 Gi + 512 Mi, 1–2 executor | — | 24/7 пока запущен |
 
 ### Программные
 
@@ -117,11 +118,12 @@ flowchart LR
 | `airflowVersion` / `defaultAirflowTag` | `helm-values/airflow.yaml` | `2.10.4` | версия Airflow |
 | `extraEnv.AIRFLOW__METRICS__STATSD_*` | `helm-values/airflow.yaml` | `prometheus-statsd-exporter.monitoring:9125`, prefix `airflow` | экспорт метрик в StatsD |
 | `extraEnv.AIRFLOW__LOGGING__REMOTE_*` | `helm-values/airflow.yaml` | `s3://artifacts/airflow-logs` | удалённые логи в MinIO |
-| dbt Hudi defaults | `dbt/dbt_project.yml` | `incremental` / `hudi` / `merge` | стратегия dbt-моделей |
+| dbt defaults | `dbt/dbt_project.yml` | `incremental` / `hudi` / `merge` (gold cancellations — `table`) | стратегия dbt-моделей |
 | `vars.base_currency` | `dbt/dbt_project.yml` | `TGRK` | базовая валюта конверсии |
-| `restartPolicy` | `k8s/spark-applications/bronze-*.yaml` | `Always`, `onFailureRetries: 10` | поведение стримов при сбое |
-| `dynamicAllocation.{min,max}Executors` | `k8s/spark-applications/*.yaml` | `1 / 3` (s3), `1 / 2` (kafka) | авто-скейл executors |
-| `schedule` (DAG) | `airflow/dags/transactions_pipeline.py` | `0 2 * * *` | расписание трансформаций |
+| `BRONZE_RESOURCE_PROFILES` | `airflow/dags/_common.py` | per source (transactions/cancellations/exchange_rates) | ресурсы Spark на ingest-task |
+| `restartPolicy` | `k8s/spark-applications/bronze-kafka-ingest.yaml` | `Always`, `onFailureRetries: 10` | поведение Kafka-стрима при сбое |
+| `schedule` (DAG) | `airflow/dags/bronze_s3_ingest.py` | `0 2 * * *` | bronze ingest (T-1) |
+| `schedule` (DAG) | `airflow/dags/transactions_medallion.py` | `30 2 * * *` | dbt silver → gold → test |
 | `KIND_CONTEXT` | `Makefile` | `docker-desktop` | текущий kubectl-context |
 
 ### Секреты
@@ -154,7 +156,7 @@ flowchart TD
     F --> G([Готово])
 ```
 
-`make up` внутри последовательно выполняет: создание namespaces и секретов, сборку образов, `helmfile sync`, инициализацию HMS, создание ConfigMap'ов, применение streaming SparkApps, unpause DAG'а и smoke-тесты.
+`make up` внутри последовательно выполняет: создание namespaces и секретов, сборку образов, `helmfile sync`, инициализацию HMS, создание ConfigMap'ов, применение reference-batch, unpause DAG'ов и `bootstrap-pipeline` (ждёт первого наполнения gold). Kafka speed-слой не запускается автоматически.
 
 ### Пошагово
 
@@ -183,7 +185,7 @@ flowchart TD
    kubectl -n data-platform get pods
    kubectl -n spark-jobs get sparkapplication
    ```
-   Все pod'ы — `Running` или `Completed`; `SparkApplication`'ы `bronze-s3-streaming` и `bronze-reference-batch` присутствуют.
+   Все pod'ы — `Running` или `Completed`; `SparkApplication` `bronze-reference-batch` присутствует (`COMPLETED` после первого `make up`). DAG'и `bronze_s3_ingest` и `transactions_medallion` — unpaused.
 
 4. **DNS.**
    ```bash
@@ -195,7 +197,7 @@ flowchart TD
    ```bash
    make verify-trino
    ```
-   После первого ingest (1–3 минуты) ожидается `hudi.bronze.transactions OK`.
+   После первого прогона `bronze_s3_ingest` (триггерится `bootstrap-pipeline`) ожидается `hudi.bronze.transactions OK`.
 
 6. **Дашборды.**
    ```bash
@@ -212,10 +214,12 @@ flowchart TD
 | `make help` | список таргетов |
 | `make images` | сборка трёх Docker-образов (skip, если уже собраны) |
 | `make spark-code` / `make dbt-configmap` | пересоздать ConfigMap с кодом |
-| `make streaming-apps` | пере-применить streaming SparkApps |
 | `make reference-batch` | one-shot bronze-reference-batch |
+| `make kafka-streaming-app` | поднять Kafka speed-слой (опционально) |
 | `make airflow-dags` | скопировать DAG-файлы в scheduler pod |
-| `make airflow-trigger-pipeline` | ручной триггер DAG |
+| `make airflow-trigger-bronze` | ручной триггер `bronze_s3_ingest` |
+| `make airflow-trigger-medallion` | ручной триггер `transactions_medallion` |
+| `make bootstrap-pipeline` | ждать первого наполнения gold-таблиц через Trino |
 | `make verify-trino` | smoke-тест Trino |
 | `make diff` | `helmfile diff` |
 | `make status` | `kubectl get pods` по всем ns |
@@ -228,10 +232,10 @@ flowchart TD
 
 1. Обновить версии:
    - чарта — в `helmfile.yaml` (`version: ...`);
-   - образа — в `docker/<service>/Dockerfile` и во всех ссылках на тег (`Makefile`, `helm-values/*.yaml`, `k8s/spark-applications/*.yaml`, `airflow/dags/transactions_pipeline.py:SPARK_IMAGE`).
+   - образа — в `docker/<service>/Dockerfile` и во всех ссылках на тег (`Makefile`, `helm-values/*.yaml`, `k8s/spark-applications/*.yaml`, `airflow/dags/_common.py:SPARK_IMAGE`).
 2. Посмотреть изменения: `make diff`.
 3. Применить: `make up`. `helmfile sync` обновляет releases поочерёдно (Deployment — RollingUpdate, StatefulSet — OrderedReady).
-4. Проверить: `make status`, `make verify-trino`, прогон DAG через `make airflow-trigger-pipeline`.
+4. Проверить: `make status`, `make verify-trino`, прогон DAG'ов через `make airflow-trigger-bronze` и `make airflow-trigger-medallion`.
 
 **Совместимость данных:**
 
@@ -239,7 +243,7 @@ flowchart TD
 - Изменения схемы HMS Postgres выполняются через MetaStore upgrade (вне скоупа Lab08).
 - dbt-incremental поверх Hudi `merge` совместим вперёд при добавлении nullable-колонок.
 
-Streaming SparkApps работают с `restartPolicy: Always`. После обновления образа ресурс удаляется, `make streaming-apps` создаёт его заново; checkpoint сохраняется.
+Batch SparkApps (bronze, dbt) создаются Airflow на каждый запуск — апгрейд образа подхватывается следующим DAGRun без ручных действий. Kafka-стрим (если поднят): после обновления образа удалить ресурс и пересоздать через `make kafka-streaming-app`; checkpoint на S3 сохраняется.
 
 ---
 
@@ -248,14 +252,14 @@ Streaming SparkApps работают с `restartPolicy: Always`. После об
 **Признаки, что требуется откат:**
 
 - `make up` оставил pod'ы в `CrashLoopBackOff` дольше 10 минут, и в логах фигурирует новая версия.
-- `transactions_pipeline` валится после bump образа Spark на `dbt_silver` / `dbt_gold`.
+- `bronze_s3_ingest` или `transactions_medallion` валится после bump образа Spark.
 - `verify-trino` после апгрейда Trino или HMS не находит таблицы.
 
 **Процедура:**
 
 1. Вернуть версии в `helmfile.yaml` / Dockerfile / манифестах к предыдущим значениям:
    ```bash
-   git checkout <prev-sha> -- helmfile.yaml docker/ k8s/
+   git checkout <prev-sha> -- helmfile.yaml docker/ k8s/ airflow/dags/_common.py
    ```
 2. При необходимости — собрать предыдущий образ:
    ```bash
@@ -266,13 +270,13 @@ Streaming SparkApps работают с `restartPolicy: Always`. После об
    helm -n data-platform history <release>
    helm -n data-platform rollback <release> <REVISION>
    ```
-4. Перезапустить streaming SparkApps:
+4. Если поднят Kafka-стрим — пересоздать:
    ```bash
-   kubectl -n spark-jobs delete sparkapplication bronze-s3-streaming bronze-kafka-ingest --ignore-not-found
-   make streaming-apps
+   kubectl -n spark-jobs delete sparkapplication bronze-kafka-ingest --ignore-not-found
+   make kafka-streaming-app
    ```
-   Чекпойнты на S3 переживают rollback — стримы возобновятся с того же offset.
-5. Проверить: `make status`, `make verify-trino`, прогон DAG.
+   Чекпойнт на S3 переживает rollback — стрим возобновится с того же offset.
+5. Проверить: `make status`, `make verify-trino`, прогон DAG'ов.
 
 Откат с потерей данных — это `make down`: удаляет PVC MinIO и базу HMS, Hudi-таблицы и каталог метаданных пропадают.
 
@@ -313,10 +317,11 @@ make down
 | `make up` → «secrets.yaml not found» | не создан файл секретов | `cp k8s/secrets.example.yaml k8s/secrets.yaml`, заполнить, `make secrets` |
 | Pod HMS в `CrashLoopBackOff` > 10 минут | Postgres ещё не готов или arm64 + QEMU работает медленно | `kubectl -n data-platform logs hive-metastore-0`; повторить `make up` через 5 минут |
 | В логах Spark `bucket lake/ does not exist` | `ensure-buckets` не отработал | `make ensure-buckets`; проверить `kubectl -n storage get pod -l v1.min.io/tenant=lab08` |
-| `bronze-s3-streaming` падает с ошибкой auth к YC S3 | не настроен anonymous provider | проверить `spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider` в `bronze-s3-streaming.yaml` |
-| `dbt_silver` падает с «Hudi timeline corrupted» | рассинхронизация state после kill драйвера | `make reset-watermarks`; для cancellations — `make reset-cancellations` |
-| `wait_bronze_ready` всегда тайм-аутит | стрим не пишет в `ingest_watermarks` | `kubectl -n spark-jobs logs <bronze-s3-streaming-driver>`; проверить креды S3 и доступ к YC |
-| Trino → `TABLE_NOT_FOUND` | первый ingest ещё не завершён | подождать 1–3 минуты; `SHOW TABLES IN hudi.bronze` |
+| `bronze_*` таска падает с ошибкой auth к YC S3 | не настроен anonymous provider | проверить `spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider` в `_common.py:SPARK_CONF` |
+| `bronze_s3_ingest` skipped целиком | `check_source_day` не нашёл `day=<ds>/` в YC bucket — это легальный исход (нечего грузить) | проверить YC bucket вручную; при необходимости — clear таски с другим `ds` |
+| `transactions_medallion` падает на `bronze_ready` (timeout) | bronze за тот же `ds` не отработал | посмотреть статус `bronze_s3_ingest` за `ds`, clear + retrigger |
+| Bronze-таска падает / тайм-аутит | смотреть `kubectl -n spark-jobs logs <driver-pod>`; clear таски — Hudi upsert идемпотентен |
+| Trino → `TABLE_NOT_FOUND` | первый ingest ещё не завершён | дождаться `bronze_s3_ingest` за первый `ds`; `SHOW TABLES IN hudi.bronze` |
 | `make superset-init` → auth error | Superset ещё инициализируется | повторить через минуту; `kubectl -n data-platform get pod -l app=superset` |
 | `*.lab08.local` не открывается | не выполнен `make hosts` | `make hosts` (требует sudo) |
 | `make down` зависает на namespace в `Terminating` | финализаторы Spark Operator / MinIO CRD | дождаться (тайм-аут 300s); при зависании — `kubectl patch ns <ns> -p '{"metadata":{"finalizers":[]}}' --type=merge` |

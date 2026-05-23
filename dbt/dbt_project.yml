@@ -19,6 +19,11 @@ models:
       +incremental_strategy: merge
       +schema: silver
       +location_root: s3a://lake/silver
+      +pre_hook:
+        - "set hoodie.keep.min.commits=30"
+        - "set hoodie.keep.max.commits=40"
+        - "set hoodie.clean.commits.retained=10"
+        - "set hoodie.archive.automatic=false"
       transactions_clean:
         +tblproperties:
           hoodie.parquet.compression.codec: zstd
@@ -87,6 +92,11 @@ models:
       +incremental_strategy: merge
       +schema: gold
       +location_root: s3a://lake/gold
+      +pre_hook:
+        - "set hoodie.keep.min.commits=30"
+        - "set hoodie.keep.max.commits=40"
+        - "set hoodie.clean.commits.retained=10"
+        - "set hoodie.archive.automatic=false"
       transactions_by_hour:
         +tblproperties:
           hoodie.parquet.compression.codec: zstd

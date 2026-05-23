@@ -4,16 +4,22 @@
   Считается по дням, только по реальным пользователям.
   Джойним cancellations_clean → transactions_clean по original_transaction_id.
 
-  ADR-003 (late-arriving): materialized=table — full rebuild на каждый run.
+  ADR-003 (late-arriving): incremental + merge с пересчётом ЗАТРОНУТЫХ cancel_day.
   Late-arriving cancellation попадает в silver в день ingested_at, но
-  обновляет event_day-партицию прошлого дня. Инкрементный пересчёт только
-  за run_date затёр бы корректный исторический агрегат частичными данными.
-  Объём gold-таблицы — десятки строк (день × причина), full rebuild дёшев.
+  обновляет event_day-партицию прошлого дня. Поэтому в инкременте берём
+  все cancellations_clean для тех cancel_day, по которым сегодня приехали
+  новые строки (date(ingested_at)=run_date), и пересчитываем агрегат
+  целиком. MERGE по pk (cancel_day|reason) перезаписывает старую строку.
 #}
-{{ config(materialized='table', unique_key='pk', file_format='hudi',
-   options={'primaryKey': 'pk', 'preCombineField': 'updated_at', 'type': 'cow'}) }}
+{{ config(
+    materialized='incremental',
+    file_format='hudi',
+    incremental_strategy='merge',
+    unique_key='pk',
+    options={'primaryKey': 'pk', 'preCombineField': 'updated_at', 'type': 'cow'}
+) }}
 
-WITH cancellations AS (
+WITH cancellations_base AS (
     SELECT
         c.cancellation_id,
         c.original_transaction_id,
@@ -25,6 +31,20 @@ WITH cancellations AS (
         c.ingested_at
     FROM {{ ref('cancellations_clean') }} c
 ),
+{% if is_incremental() %}
+affected_days AS (
+    SELECT DISTINCT cancel_day
+    FROM cancellations_base
+    WHERE to_date(ingested_at) = {{ run_date() }}
+),
+cancellations AS (
+    SELECT c.*
+    FROM cancellations_base c
+    JOIN affected_days a ON a.cancel_day = c.cancel_day
+),
+{% else %}
+cancellations AS (SELECT * FROM cancellations_base),
+{% endif %}
 tx_dedup AS (
     SELECT
         transaction_id,

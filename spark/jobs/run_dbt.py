@@ -25,12 +25,16 @@ def main() -> int:
 
     from pyspark.sql import SparkSession
     from dbt.cli.main import dbtRunner
-    from log_utils import get_logger
+    from utils.log import get_logger
 
     log = get_logger(__name__)
 
-    spark = SparkSession.builder.getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
+    spark = (
+        SparkSession.builder
+        .config("spark.hadoop.hive.metastore.client.socket.timeout", "600s")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("ERROR")
 
     args = sys.argv[1:] or ["debug"]
     log.info("invoking dbt with args: %s", args)

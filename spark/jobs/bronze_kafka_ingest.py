@@ -4,10 +4,9 @@ from functools import partial
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 
-from hudi_utils import hudi_opts, write_hudi
-from hudi_commit_meta import read_latest_commit, normalize_partitions
-from log_utils import get_logger
-from watermark_utils import bootstrap_watermark_table, write_watermark
+from utils.hudi import hudi_opts, write_hudi, read_latest_commit, normalize_partitions
+from utils.log import get_logger
+from utils.watermark import bootstrap_watermark_table, write_watermark
 
 
 log = get_logger(__name__)
@@ -147,9 +146,10 @@ def main():
              .config("spark.sql.adaptive.enabled", "true")
              .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
              .config("spark.streaming.stopGracefullyOnShutdown", "true")
+             .config("spark.hadoop.hive.metastore.client.socket.timeout", "600s")
              .enableHiveSupport()
              .getOrCreate())
-    spark.sparkContext.setLogLevel("WARN")
+    spark.sparkContext.setLogLevel("ERROR")
 
     bootstrap_watermark_table(spark)
     instant, _, _ = read_latest_commit(spark, f"{_HUDI_BASE}/transactions_kafka", None)

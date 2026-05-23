@@ -7,7 +7,7 @@
   cancellation_id с partition path не связан. Без global-index одинаковый
   cancellation_id из разных микро-батчей с разным cancelled_ts уезжает в
   разные партиции и BLOOM (partition-scoped) их не дедупит → cross-partition
-  дубли в silver. См. spark-jobs/hudi_utils.py: hudi_opts(global_index=...).
+  дубли в silver. См. spark/utils/hudi.py: hudi_opts(global_index=...).
 
   ADR-003 (late-arriving): инкремент по дню ЗАГРУЗКИ (date(ingested_at) = run_date),
   а не по event_day. Late-arriving cancellation за event_day=ds−k попадает в

@@ -14,7 +14,6 @@ from airflow import DAG
 from airflow.operators.python import ShortCircuitOperator
 
 from _common import (
-    BRONZE_PYFILES,
     BRONZE_RESOURCE_PROFILES,
     BRONZE_SOURCES,
     JOBS_DIR,
@@ -40,7 +39,7 @@ def _bronze_task_spec(source: str) -> dict:
             "--ds", "{{ ds }}",
             "--src-root", SOURCE_ROOT,
         ],
-        py_files=BRONZE_PYFILES,
+        py_files=(),
         app_label=f"bronze-{source}",
         extra_conf=UPSTREAM_BUCKET_CONF,
         resource_profile=BRONZE_RESOURCE_PROFILES[source],

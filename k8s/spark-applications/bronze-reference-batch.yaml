@@ -13,10 +13,6 @@ spec:
   mainApplicationFile: "local:///opt/spark/jobs/bronze_reference_batch.py"
   arguments:
     - "--reference-path=s3a://npl-de18-lab8-data/reference/"
-  deps:
-    pyFiles:
-      - "local:///opt/spark/jobs/log_utils.py"
-      - "local:///opt/spark/jobs/hudi_utils.py"
   sparkVersion: "3.5.8"
   restartPolicy:
     type: OnFailure
@@ -44,6 +40,8 @@ spec:
     "spark.hadoop.fs.s3a.bucket.npl-de18-lab8-data.aws.credentials.provider": "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider"
     "spark.kubernetes.namespace": "spark-jobs"
     "spark.kubernetes.executor.deleteOnTermination": "true"
+    "spark.kubernetes.driverEnv.PYTHONPATH": "/opt/spark/jobs"
+    "spark.executorEnv.PYTHONPATH": "/opt/spark/jobs"
   driver:
     cores: 1
     memory: "1g"
@@ -60,6 +58,8 @@ spec:
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
+      - name: spark-utils-code
+        mountPath: /opt/spark/jobs/utils
   executor:
     cores: 1
     instances: 1
@@ -76,7 +76,12 @@ spec:
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
+      - name: spark-utils-code
+        mountPath: /opt/spark/jobs/utils
   volumes:
     - name: jobs-code
       configMap:
         name: spark-jobs-code
+    - name: spark-utils-code
+      configMap:
+        name: spark-utils-code

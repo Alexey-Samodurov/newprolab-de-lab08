@@ -7,7 +7,7 @@ webhook:
   port: 9443
 
 controller:
-  workers: 5
+  workers: 10
 
 metrics:
   enable: true
@@ -17,9 +17,9 @@ metrics:
 
 resources:
   requests:
-    cpu: 100m
-    memory: 256Mi
+    cpu: 200m
+    memory: 768Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: "1"
+    memory: 1536Mi
 

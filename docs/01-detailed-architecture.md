@@ -6,10 +6,10 @@ Lab08 — локально разворачиваемый лейкхаус дл�
 
 - **Источники данных:** JSONL-файлы из Yandex Cloud S3 (бакет `npl-de18-lab8-data`) и поток событий из внешней Kafka.
 - **Хранилище:** Apache Hudi (Copy-on-Write) поверх MinIO, разложено по слоям `bronze / silver / gold`.
-- **Трансформации:** dbt-spark, режим `session`, incremental-модели через Hudi `merge`.
+- **Трансформации:** dbt-spark, режим `session`, incremental-модели через Hudi `merge` (часть gold по cancellations — `materialized='table'`).
 - **Каталог:** Hive Metastore с Postgres-бэкендом.
 - **Чтение:** Trino 470 (read-only), Apache Superset 4.x для дашбордов.
-- **Оркестрация:** Airflow 2.10.4 на `KubernetesExecutor`. Стриминг — долгоживущие `SparkApplication` CRD.
+- **Оркестрация:** Airflow 2.10.4 на `KubernetesExecutor`. Bronze S3 и медальон — посуточные DAG'и; Kafka — долгоживущий `SparkApplication` (speed-слой, опционально).
 - **Метрики:** kube-prometheus-stack, Spark Prometheus servlet, statsd-exporter для Airflow.
 
 Среда — Kubernetes (kind или Docker Desktop). Конфигурация декларативная: `helmfile.yaml` плюс raw-манифесты в `k8s/`.
@@ -48,8 +48,9 @@ flowchart LR
     end
 
     subgraph Ingest["Ingest (ns: spark-jobs)"]
-        S3S[bronze-s3-streaming]
-        KS[bronze-kafka-ingest]
+        S3B[bronze-s3-batch<br/>daily, per source]
+        REF[bronze-reference-batch<br/>one-shot]
+        KS[bronze-kafka-ingest<br/>streaming, optional]
     end
 
     subgraph Storage["Storage (ns: storage / data-platform)"]
@@ -71,14 +72,18 @@ flowchart LR
         SO[Spark Operator]
     end
 
-    YCS3 --> S3S
+    YCS3 --> S3B
+    YCS3 --> REF
     KFK --> KS
-    S3S --> MinIO
+    S3B --> MinIO
+    REF --> MinIO
     KS --> MinIO
-    S3S --> HMS
+    S3B --> HMS
+    REF --> HMS
     KS --> HMS
 
     AF --> SO --> DBT
+    AF --> S3B
     DBT --> MinIO
     DBT --> HMS
 
@@ -125,42 +130,63 @@ flowchart LR
 
 ## Компоненты
 
-### Стриминговый ingest
+### Bronze ingest
+
+Lambda-разделение: batch — источник истины, Kafka — speed-слой.
 
 ```mermaid
 flowchart LR
-    YCS3[YC S3] --> S3main[bronze_s3_streaming.py]
+    YCS3[YC S3] --> S3B[bronze_s3_batch.py<br/>--source --ds]
+    YCS3 --> REF[bronze_reference_batch.py]
     KFK[Kafka] --> Kmain[bronze_kafka_ingest.py]
 
-    S3main --> Handlers[handlers: transactions / cancellations / rates / reference]
-    Kmain --> KProc[process_batch: split by _source]
-
-    Handlers --> HU[hudi_utils.write_hudi]
-    KProc --> HU
-    Handlers --> WM[watermark_utils → bronze.ingest_watermarks]
+    S3B --> HU[utils.hudi.write_hudi]
+    REF --> HU
+    Kmain --> HU
+    S3B --> WM[utils.watermark → bronze.ingest_watermarks]
 
     HU --> MinIO[(MinIO: lake/, checkpoints/)]
     HU --> HMS[HMS]
 ```
 
-Оба `SparkApplication` запускаются с `restartPolicy: Always`, `onFailureRetries: 10`. Чекпойнты лежат на S3 — при рестарте пода обработка продолжается с того же места. Exactly-once на уровне файлов обеспечивается связкой checkpoint + Hudi upsert по `composite_pk` (или обычному PK). Dynamic allocation: 1–3 executor.
+**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. CLI: `--source {transactions|cancellations|exchange_rates} --ds <YYYY-MM-DD> --src-root s3a://npl-de18-lab8-data`. Идемпотентный upsert по `composite_pk` (transactions) / `cancellation_id` / `rate_pk`. Watermark пишет **только** `transactions` — это снимает HMS race-condition при параллельном создании таблицы тремя подами.
 
-### DAG `transactions_pipeline`
+**Reference (`bronze_reference_batch.py`)** — one-shot загрузка `users / test_users / promo_codes`. Запускается из `make up` через `make reference-batch`.
+
+**Kafka (`bronze_kafka_ingest.py`)** — долгоживущий `SparkApplication` с `restartPolicy: Always`, `onFailureRetries: 10`. Чекпоинт на S3, exactly-once на уровне файлов через checkpoint + Hudi upsert. Dynamic allocation 1–2 executor. Запускается по необходимости (`make kafka-streaming-app`); основной аналитический контур работает без него.
+
+### DAG `bronze_s3_ingest`
 
 ```mermaid
 flowchart LR
-    Wait[wait_bronze_ready<br/>PythonSensor] --> Check[check_partition_has_data<br/>ShortCircuit]
-    Check -->|rows > 0| Silver[dbt_silver]
-    Check -->|rows = 0| Skip([skip])
+    Check[check_source_day<br/>ShortCircuit] -->|day exists| Tx[bronze_transactions]
+    Check --> Can[bronze_cancellations]
+    Check --> Er[bronze_exchange_rates]
+    Check -->|day missing| Skip([skip])
+```
+
+Расписание `0 2 * * *`, `start_date=2026-04-24`, `catchup=True`, `max_active_runs=1`, T-1 (грузит `ds = вчера`). `check_source_day` — ShortCircuit-гейт на наличие S3-партиции: если директории нет, слот сразу skipped без ретраев. Три bronze-таски запускаются параллельно одноразовыми `SparkApplication` через `SparkKubernetesOperator`.
+
+Ресурсные профили per source (`_common.BRONZE_RESOURCE_PROFILES`):
+
+| Источник | Driver | Executor | Instances |
+|---|---|---|---|
+| `transactions` | 1g + 256m | 1g + 512m | 2 (fixed) |
+| `cancellations` | 512m + 128m | 512m + 256m | 1 |
+| `exchange_rates` | 512m + 128m | 512m + 256m | 1 |
+
+### DAG `transactions_medallion`
+
+```mermaid
+flowchart LR
+    Wait[bronze_ready<br/>PythonSensor reschedule] --> Silver[dbt_silver]
     Silver --> Gold[dbt_gold]
     Gold --> Test[dbt_test]
 ```
 
-Расписание: `0 2 * * *`. `start_date=2026-04-24`, `catchup=True`, `max_active_runs=1`.
+Расписание `30 2 * * *` (сдвиг даёт bronze ~30 мин на завершение). `bronze_ready` — `PythonSensor(mode=reschedule, poke=60s, timeout≈6m)` ждёт строку в `bronze.ingest_watermarks` за нужный `ds`. При таймауте DAGRun падает — видно в UI (без silent-skip).
 
-`wait_bronze_ready` опрашивает `hudi.bronze.ingest_watermarks` через Trino (poke 30s, timeout 10m, mode=reschedule). `check_partition_has_data` пропускает downstream-таски, если в партиции нет строк.
-
-Каждая dbt-таска поднимает одноразовый `SparkApplication` (`restartPolicy: Never`). `mainApplicationFile=local:///opt/spark/jobs/run_dbt.py`. dbt-проект подкладывается из ConfigMap `dbt-project` (mount `/tmp/cm`), код задач — из `spark-jobs-code` (mount `/opt/spark/jobs`). AWS-ключи прокидываются через `envSecretKeyRefs` из секрета `lab08-credentials`.
+Каждая dbt-таска поднимает одноразовый `SparkApplication` (`restartPolicy: Never`, `mainApplicationFile=local:///opt/spark/jobs/run_dbt.py`). dbt-проект — из ConfigMap `dbt-project` (`/tmp/cm`), код задач — из `spark-jobs-code` (`/opt/spark/jobs`). AWS-ключи прокидываются через `envSecretKeyRefs` из `lab08-credentials`.
 
 ### dbt-проект
 
@@ -211,7 +237,7 @@ flowchart LR
   STX --> GDQ
 ```
 
-Профиль `lab08`, адаптер `dbt-spark` 1.8.0 в режиме `method: session`. Дефолты: `materialized=incremental`, `file_format=hudi`, `incremental_strategy=merge`, `location_root=s3a://lake/{silver,gold}`. Базовая валюта (`vars.base_currency`) — `TGRK`.
+Профиль `lab08`, адаптер `dbt-spark` 1.8.0 в режиме `method: session`. Дефолты: `materialized=incremental`, `file_format=hudi`, `incremental_strategy=merge`, `location_root=s3a://lake/{silver,gold}`. Базовая валюта (`vars.base_currency`) — `TGRK`. Витрины по cancellations (`cancellations_summary`, `refunds_daily`) — `materialized='table'` (десятки строк, безопаснее пересобирать целиком).
 
 Hudi-настройки: `compression=zstd`, `clean.policy=KEEP_LATEST_COMMITS`, `commits.retained=2`, inline clustering на silver, column-stats индекс по `event_day, hour_of_day, is_test_user`.
 
@@ -223,28 +249,30 @@ Hudi-настройки: `compression=zstd`, `clean.policy=KEEP_LATEST_COMMITS`,
 
 ## Сценарии работы
 
-### Стриминговый ingest S3 → bronze
+### Bronze ingest S3 → Hudi (daily batch)
 
 ```mermaid
 sequenceDiagram
     autonumber
+    participant AF as Airflow
+    participant SO as Spark Operator
+    participant Drv as bronze_s3_batch.py
     participant YC as YC S3
-    participant Drv as Driver
-    participant Exec as Executor
     participant MinIO
     participant HMS
     participant W as ingest_watermarks
 
-    loop micro-batch
-        Drv->>YC: list & read JSONL
-        YC-->>Exec: новые файлы
-        Exec->>Exec: enrich (composite_pk, event_day, ingested_at)
-        Exec->>MinIO: write_hudi(upsert)
-        Exec->>HMS: register / alter
-        Exec->>W: write_watermark
-        Drv->>MinIO: commit checkpoint
+    AF->>AF: check_source_day (ShortCircuit)
+    AF->>SO: spawn bronze_{source} (×3 parallel)
+    SO->>Drv: --source --ds
+    Drv->>YC: read day=<ds>/**/*.jsonl
+    Drv->>Drv: enrich (composite_pk, event_day, ingested_at)
+    Drv->>MinIO: write_hudi(upsert)
+    Drv->>HMS: register / alter
+    alt source == transactions
+        Drv->>W: write_watermark(ds)
     end
-    Note over Drv,MinIO: рестарт пода → resume offset → идемпотентный upsert
+    Note over Drv: retry / clear DAGRun → идемпотентный upsert
 ```
 
 ### Ежедневные трансформации
@@ -253,21 +281,18 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant Cron as Scheduler
-    participant S as wait_bronze_ready
+    participant S as bronze_ready (PythonSensor)
     participant T as Trino
-    participant SC as check_partition
     participant SO as Spark Operator
 
-    Cron->>S: trigger (ds)
-    loop poke 30s, timeout 10m
-        S->>T: SELECT 1 FROM ingest_watermarks
+    Cron->>S: trigger (ds, 02:30 UTC)
+    loop poke 60s, timeout ~6m
+        S->>T: SELECT 1 FROM ingest_watermarks WHERE ds = ...
     end
-    S->>SC: ready
-    SC->>T: SELECT rows_in_batch
-    alt rows > 0
-        SC->>SO: spawn dbt-silver → dbt-gold → dbt-test
-    else
-        SC-->>Cron: skip
+    alt watermark present
+        S->>SO: spawn dbt-silver → dbt-gold → dbt-test
+    else timeout
+        S-->>Cron: fail (visible in UI)
     end
 ```
 
