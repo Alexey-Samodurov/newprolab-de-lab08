@@ -1,22 +1,10 @@
 {#
-  Gold: Дневная GROSS-выручка в базовой валюте TGRK.
-
-  ADR (FIX_PLAN P1-1):
-   * `gross_revenue_tgrk` = sum(amount / rate_to_tgrk) по completed-purchase
-     транзакциям реальных пользователей. Невалидные суммы (amount<=0 или NULL)
-     ИСКЛЮЧЕНЫ через `is_amount_invalid = false`.
-   * Это GROSS — refunds НЕ вычитаются из дня транзакции. Refund-ы относятся
-     к дню отмены и считаются отдельно в `refunds_daily` (см. P1-2).
-     Причина — daily-схема без пересчёта истории (см. P0-1): отмена за tx_day=N
-     приходит в day=N+K и не должна задним числом править revenue_daily[N].
-   * Конвертация: rate_to_tgrk = «сколько единиц <currency> за 1 TGRK»,
-     `amount_tgrk = amount / rate_to_tgrk`. TGRK→TGRK = 1.0.
-   * Курс ищется как-of `event_day` через forward+backward fill из
-     `exchange_rates_long`. `rate_source` показывает, использовался ли
-     forward (последний известный до даты) или backward (первый после).
-     Если ни одного нет — конвертация = NULL, и транзакция не попадает в gross.
-   * Список валют не хардкодится — джойн по `currency` через long-таблицу
-     (см. P1-9).
+  Gold: дневная GROSS-выручка в базовой валюте TGRK.
+  Сумма по completed-purchase транзакциям реальных пользователей с
+  валидной суммой. GROSS — возвраты НЕ вычитаем: отмена живёт в своём
+  дне (refunds_daily), задним числом выручку не правим.
+  Курс — как-of event_day с forward/backward fill, rate_source показывает
+  какой именно. Если курса нет совсем — транзакция в gross не попадает.
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge', unique_key='event_day',
    options={'primaryKey': 'event_day', 'preCombineField': 'updated_at', 'type': 'cow'}) }}

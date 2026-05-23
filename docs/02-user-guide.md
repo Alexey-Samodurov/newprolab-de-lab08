@@ -29,7 +29,7 @@ Lab08 — учебный стенд транзакционной аналити�
 5. **Проверка состояния:** `make status`. Все pod'ы должны быть в статусе `Running` или `Completed`.
 6. **Дашборды:** `make superset-init` — создаёт чарты и дашборд в Superset.
 
-Kafka-стрим (speed-слой) опционален: запускается отдельно через `make kafka-streaming-app`. Основной аналитический контур работает без него.
+Kafka-стрим и streaming-medallion поднимаются `make up` автоматически. Если хочешь без NRT-слоя — пропусти `make kafka-streaming-app` и `make streaming-medallion-app`; batch-контур (bronze S3 + dbt + Superset settled) работает независимо.
 
 Если `make up` падает на этапе HMS, следует подождать 5 минут и повторить запуск: Postgres и HMS на arm64 поднимаются медленно.
 
@@ -83,6 +83,7 @@ flowchart LR
 | Триггернуть медальон | `make airflow-trigger-medallion` или Airflow UI |
 | Перезапустить reference-batch | `make reference-batch` |
 | Включить Kafka speed-слой | `make kafka-streaming-app` |
+| Включить streaming-medallion (NRT gold) | `make streaming-medallion-app` |
 | Обновить PySpark-код | правка `spark/*.py` → `make spark-code` (перезапуск стрима — вручную, см. ниже) |
 | Обновить dbt | правка `dbt/` → `make dbt-configmap` |
 | Создать дашборды | `make superset-init` |
@@ -135,7 +136,7 @@ flowchart LR
 ```sql
 SELECT * FROM hudi.gold.revenue_daily ORDER BY event_day DESC LIMIT 30;
 SELECT count(*) FROM hudi.bronze.transactions;
-SELECT * FROM hudi.bronze.ingest_watermarks ORDER BY committed_at DESC LIMIT 20;
+SELECT * FROM hudi.bronze.ingest_watermarks_transactions ORDER BY committed_at DESC LIMIT 20;
 ```
 
 В Superset — готовый дашборд `Lab08 Transactions Overview` или SQL Lab на том же каталоге.
@@ -154,7 +155,8 @@ SELECT * FROM hudi.bronze.ingest_watermarks ORDER BY committed_at DESC LIMIT 20;
 
 - **bronze.*** — сырые данные плюс технические поля (`composite_pk`, `event_day`, `ingested_at`). Hudi upsert, exactly-once на уровне файлов через checkpoint.
 - **silver.*** — типизация, дедуп, флаги качества: `is_user_missing`, `is_user_unknown`, `is_test_user`, `is_amount_invalid`, `is_revenue_eligible`, `is_promo_expired_at_use`.
-- **gold.*** — витрины: `transactions_by_hour`, `purchases_by_hour`, `revenue_daily`, `refunds_daily`, `cancellations_summary`, `promo_codes_analysis`, `promo_expired_usage_daily`, `user_cohorts`, `dq_summary_daily`. Cancellations-витрины (`cancellations_summary`, `refunds_daily`) — `materialized='table'`, остальные — Hudi-incremental.
+- **gold.*** — settled-витрины: `transactions_by_hour`, `purchases_by_hour`, `revenue_daily`, `refunds_daily`, `cancellations_summary`, `promo_codes_analysis`, `promo_expired_usage_daily`, `user_cohorts`, `dq_summary_daily`. Пишутся dbt-ом за дни ≤ `s3_high_watermark`.
+- **gold.*_live** — NRT-копии 3-х витрин + `exchange_rates_latest`, пишутся `streaming_medallion`. Дашборд видит обе стороны через Superset virtual dataset `gold.*_unified` (UNION с cutover-фильтром).
 
 ### Бизнес-правила
 
@@ -217,12 +219,13 @@ kubectl -n spark-jobs logs <driver-pod>
 | **Trino** | Distributed SQL engine, в Lab08 в режиме read-only с каталогом `hudi` |
 | **Superset** | BI-инструмент, дашборды поверх Trino |
 | **SparkApplication** | CRD `sparkoperator.k8s.io/v1beta2` от Kubeflow Spark Operator |
-| **Streaming SparkApp** | Долгоживущий `SparkApplication` (`restartPolicy: Always`) — в Lab08 это только `bronze-kafka-ingest` (опциональный speed-слой) |
+| **Streaming SparkApp** | Долгоживущий `SparkApplication` (`restartPolicy: Always`): `bronze-kafka-ingest` (Kafka → bronze) и `streaming-medallion` (bronze → `gold.*_live`) |
 | **Batch SparkApp** | Эфемерный `SparkApplication` (`restartPolicy: Never`), создаётся Airflow на каждую задачу: bronze S3 batch, reference, dbt |
 | **dbt-spark (session)** | Адаптер dbt, использующий уже сконфигурированный SparkSession в driver pod |
 | **composite_pk** | `concat_ws('|', transaction_id, created_at, user_id)` — record key Hudi для транзакций, компенсирует дубли |
 | **`_ingested_at`** | Технический timestamp, precombine-поле Hudi для dedup latest-wins |
-| **bronze.ingest_watermarks** | Commit-log стримов `(table_name, source_partition, rows_in_batch, committed_at)`. На нём завязан Airflow-сенсор |
+| **bronze.ingest_watermarks_\<source\>** | Per-source Hudi commit-log, один writer на shard (`ingest_watermarks_transactions`, `_cancellations`, `_exchange_rates`, `_kafka`). На S3-shards завязан Airflow-сенсор |
 | **TGRK** | Внутренний код базовой валюты конверсии, задан через `vars.base_currency` |
 | **PythonSensor (reschedule)** | Airflow-сенсор, освобождающий worker-slot между poke-итерациями |
+| **gold.\<x\>_unified** | Superset virtual dataset: UNION `gold.<x>` (settled, dbt) и `gold.<x>_live` (NRT, streaming), фильтр `event_day > max(settled)` |
 | **ShortCircuitOperator** | Пропускает downstream-таски, если callable вернул `False` |

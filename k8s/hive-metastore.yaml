@@ -26,7 +26,7 @@ data:
       </property>
       <property>
         <name>javax.jdo.option.ConnectionURL</name>
-        <value>jdbc:postgresql://hive-metastore-postgresql.data-platform.svc.cluster.local:5432/metastore</value>
+        <value>jdbc:postgresql://postgres.data-platform.svc.cluster.local:5432/metastore</value>
       </property>
       <property>
         <name>javax.jdo.option.ConnectionUserName</name>
@@ -85,13 +85,18 @@ spec:
           envFrom:
             - secretRef:
                 name: minio-credentials
+          env:
+            - name: METASTORE_DB_HOSTNAME
+              value: postgres.data-platform.svc.cluster.local
+            - name: METASTORE_DB_PORT
+              value: "5432"
           volumeMounts:
             - name: conf
               mountPath: /opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml
               subPath: metastore-site.xml
           resources:
             requests:
-              cpu: 150m
+              cpu: 100m
               memory: 384Mi
             limits:
               cpu: 500m

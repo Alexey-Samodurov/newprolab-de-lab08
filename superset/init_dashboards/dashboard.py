@@ -262,7 +262,7 @@ def upsert_dashboard(
         "refresh_frequency": 0,
         "color_scheme": "supersetColors",
         "native_filter_configuration": build_native_filters(
-            test_user_dataset_id=ds.get("transactions_by_hour"),
+            test_user_dataset_id=ds.get("transactions_by_hour_unified"),
             chart_ids_with_test_user=charts_with_test_user,
             all_chart_ids=list(valid_charts.values()),
             chart_ids_without_time=charts_without_time,

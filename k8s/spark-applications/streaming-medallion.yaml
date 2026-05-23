@@ -2,7 +2,7 @@
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
-  name: bronze-kafka-ingest
+  name: streaming-medallion
   namespace: spark-jobs
 spec:
   type: Python
@@ -10,7 +10,7 @@ spec:
   mode: cluster
   image: lab08/spark:3.5.8-hudi-1.1.1
   imagePullPolicy: IfNotPresent
-  mainApplicationFile: "local:///opt/spark/jobs/bronze_kafka_ingest.py"
+  mainApplicationFile: "local:///opt/spark/jobs/streaming_medallion.py"
   arguments: []
   sparkVersion: "3.5.8"
   restartPolicy:
@@ -22,7 +22,7 @@ spec:
   sparkConf:
     "spark.sql.catalogImplementation": "hive"
     "spark.sql.warehouse.dir": "s3a://lake/warehouse/"
-    "spark.sql.streaming.checkpointLocation": "s3a://checkpoints/bronze-kafka"
+    "spark.sql.streaming.checkpointLocation": "s3a://checkpoints/streaming-medallion"
     "spark.sql.extensions": "org.apache.spark.sql.hudi.HoodieSparkSessionExtension"
     "spark.serializer": "org.apache.spark.serializer.KryoSerializer"
     "spark.kryo.registrator": "org.apache.spark.HoodieSparkKryoRegistrar"
@@ -70,7 +70,10 @@ spec:
     memoryOverhead: "256m"
     serviceAccount: spark
     labels:
-      app: bronze-kafka-ingest
+      app: streaming-medallion
+    env:
+      - name: STREAMING_MEDALLION_CHECKPOINTS
+        value: "s3a://checkpoints/streaming-medallion"
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials
@@ -78,12 +81,6 @@ spec:
       AWS_SECRET_ACCESS_KEY:
         name: lab08-credentials
         key: AWS_SECRET_ACCESS_KEY
-      KAFKA_BOOTSTRAP_SERVERS:
-        name: lab08-credentials
-        key: KAFKA_BOOTSTRAP_SERVERS
-      KAFKA_TOPIC:
-        name: lab08-credentials
-        key: KAFKA_TOPIC
     volumeMounts:
       - name: jobs-code
         mountPath: /opt/spark/jobs
@@ -91,13 +88,13 @@ spec:
         mountPath: /opt/spark/jobs/utils
   executor:
     cores: 1
-    coreRequest: "700m"
+    coreRequest: "300m"
     coreLimit: "1200m"
     instances: 1
     memory: "2g"
     memoryOverhead: "1g"
     labels:
-      app: bronze-kafka-ingest
+      app: streaming-medallion
     envSecretKeyRefs:
       AWS_ACCESS_KEY_ID:
         name: lab08-credentials

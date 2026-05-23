@@ -17,8 +17,8 @@ server:
 coordinator:
   resources:
     requests:
-      cpu: 250m
-      memory: 768Mi
+      cpu: 150m
+      memory: 640Mi
     limits:
       cpu: 1
       memory: 1536Mi
@@ -26,8 +26,8 @@ coordinator:
 worker:
   resources:
     requests:
-      cpu: 250m
-      memory: 768Mi
+      cpu: 150m
+      memory: 640Mi
     limits:
       cpu: 1
       memory: 1536Mi

@@ -1,25 +1,10 @@
 {#
-  Silver: Отмены, нормализованные.
-  Линкуем на исходную транзакцию (flag для late-arriving).
-
-  Ключ — `cancellation_pk = event_day|cancellation_id`. Сам
-  `cancellation_id` рестартует с 1 в каждом дневном файле S3, поэтому
-  он не уникален между днями и не годится как primary key. Композитный
-  pk полностью лежит внутри одной event_day-партиции — GLOBAL_BLOOM
-  не нужен, обычный BLOOM корректно дедупит.
-
-  ADR-003 (late-arriving): инкремент по дню ЗАГРУЗКИ (date(ingested_at) = run_date),
-  а не по event_day. Late-arriving cancellation за event_day=ds−k попадает в
-  обычный daily run по дню ingested_at; так как `cancelled_ts` (и значит
-  event_day и cancellation_pk) консистентен между ре-доставками, Hudi
-  корректно обновит соответствующую event_day-партицию. Downstream gold
-  cancellations_summary / refunds_daily пересчитываются как incremental
-  с merge по cancel_day.
-
-  `ingested_at` в bronze — это logical date Airflow-рана
-  (`to_timestamp(ds)`), не wall-clock. Так backfill детерминирован, а
-  фильтр `to_date(ingested_at) = run_date()` совпадает с тем же `ds`,
-  которым обрабатывался бронзовый батч.
+  Silver: нормализованные отмены транзакций.
+  Линкуем на исходную покупку, помечаем late-arriving (отмена пришла
+  позже самой транзакции). Ключ cancellation_pk = event_day|cancellation_id,
+  потому что cancellation_id уникален только внутри дня.
+  Инкремент по дню загрузки — отмена за прошлые дни корректно догоняет
+  соответствующую event_day-партицию.
 #}
 {{ config(
     materialized='incremental',

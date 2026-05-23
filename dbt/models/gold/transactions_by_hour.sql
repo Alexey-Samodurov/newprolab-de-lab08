@@ -1,6 +1,8 @@
 {#
-  Gold: Распределение транзакций по часам (для столбиков).
-  Включает все транзакции (completed/pending/failed) с флагом is_test_user.
+  Gold: распределение всех транзакций по часам дня.
+  В отличие от purchases_by_hour, считает все статусы (completed/pending/
+  failed) и разрезает по is_test_user — видно нагрузку и долю провалов
+  по часам, отдельно по реальным и тестовым юзерам.
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge', unique_key='pk',
    options={'primaryKey': 'pk', 'preCombineField': 'updated_at', 'type': 'cow'}) }}

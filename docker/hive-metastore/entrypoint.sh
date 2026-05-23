@@ -6,7 +6,7 @@ export HIVE_HOME=/opt/apache-hive-metastore-3.0.0-bin
 export HADOOP_CLASSPATH="${HADOOP_HOME}/share/hadoop/tools/lib/aws-java-sdk-bundle-1.11.375.jar:${HADOOP_HOME}/share/hadoop/tools/lib/hadoop-aws-3.2.0.jar:${HIVE_HOME}/lib/postgresql-42.7.4.jar"
 export JAVA_HOME=/usr/local/openjdk-8
 
-DB_HOST="${METASTORE_DB_HOSTNAME:-hive-metastore-postgresql.data-platform.svc.cluster.local}"
+DB_HOST="${METASTORE_DB_HOSTNAME:-postgres.data-platform.svc.cluster.local}"
 DB_PORT="${METASTORE_DB_PORT:-5432}"
 
 echo "[hms] Waiting postgres at ${DB_HOST}:${DB_PORT}..."

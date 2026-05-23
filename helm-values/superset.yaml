@@ -18,17 +18,7 @@ bootstrapScript: |
   fi
 
 postgresql:
-  enabled: true
-  image:
-    repository: bitnamilegacy/postgresql
-  primary:
-    resources:
-      requests:
-        cpu: 100m
-        memory: 256Mi
-      limits:
-        cpu: 300m
-        memory: 512Mi
+  enabled: false
 
 redis:
   enabled: true
@@ -37,17 +27,23 @@ redis:
   master:
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 192Mi
       limits:
         cpu: 500m
         memory: 512Mi
 
 supersetNode:
+  connections:
+    db_host: postgres.data-platform.svc.cluster.local
+    db_port: "5432"
+    db_user: superset
+    db_pass: superset
+    db_name: superset
   resources:
     requests:
-      cpu: 250m
-      memory: 1Gi
+      cpu: 150m
+      memory: 768Mi
     limits:
       cpu: 1
       memory: 2Gi
@@ -55,8 +51,8 @@ supersetNode:
 supersetWorker:
   resources:
     requests:
-      cpu: 200m
-      memory: 1Gi
+      cpu: 100m
+      memory: 768Mi
     limits:
       cpu: 1
       memory: 2Gi

@@ -39,7 +39,7 @@ models:
         description: "event_day|cancellation_id — глобально-уникальный ключ. Сам cancellation_id рестартует с 1 в каждом дневном файле."
         tests: [not_null, unique]
       - name: cancellation_id
-        tests: [not_null]
+        description: "ID отмены из апстрима. Может быть NULL — уникальность обеспечивается cancellation_pk."
 
   - name: exchange_rates_daily
     columns:

@@ -1,16 +1,8 @@
 {#
-  Gold: Дневной объём refund-ов по дню отмены (`cancel_day`).
-
-  ADR-003 (late-arriving): incremental + merge с пересчётом ЗАТРОНУТЫХ cancel_day.
-  Late-arriving cancellation попадает в silver в день ingested_at, но
-  обновляет event_day-партицию прошлого дня. В инкременте берём все
-  cancellations_clean для тех cancel_day, по которым сегодня приехали
-  новые строки (date(ingested_at)=run_date), пересчитываем агрегат
-  целиком; MERGE по cancel_day заменяет старую строку.
-
-  Refund сумма native — `refund_amount` из `cancellations_clean`. Конверсия
-  в TGRK не делается на этом уровне: оригинальная валюта транзакции в bronze
-  cancellations отсутствует.
+  Gold: дневной объём возвратов по дню отмены.
+  Сумма берётся в нативной валюте — в bronze cancellations нет валюты
+  исходной транзакции, поэтому в TGRK не конвертируем. Late-arriving
+  отмены пересчитывают свой исторический cancel_day целиком.
 #}
 {{ config(
     materialized='incremental',

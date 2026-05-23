@@ -26,7 +26,7 @@ sources:
             description: "event_day|cancellation_id — глобально-уникальный ключ. Сам cancellation_id рестартует с 1 в каждом дневном файле, поэтому используется только в составе pk."
             tests: [not_null, unique]
           - name: cancellation_id
-            tests: [not_null]
+            description: "ID отмены из апстрима. NULL допустим — уникальность гарантируется cancellation_pk (см. ADR-003)."
           - name: original_transaction_id
           - name: refund_amount
           - name: cancelled_ts
@@ -53,3 +53,25 @@ sources:
         columns:
           - name: promo_code_id
             tests: [not_null, unique]
+
+  - name: bronze_dlq
+    schema: bronze_dlq
+    description: "DLQ для late-arriving событий из Kafka, отвергнутых watermark-фильтром (ADR-004)."
+    tables:
+      - name: late_events
+        description: "События, у которых event_day <= s3_high_watermark на момент Kafka-ingest. Хранятся как сырая полезная нагрузка JSON для ручного recovery."
+        columns:
+          - name: dlq_pk
+            description: "{source_table}|{original_pk} — уникальный ключ записи DLQ."
+            tests: [not_null]
+          - name: source_table
+            tests: [not_null]
+          - name: reason
+            description: "Причина попадания в DLQ (event_day_le_s3_watermark и пр.)."
+          - name: event_day_observed
+            description: "event_day исходной записи (то, что попало под фильтр)."
+          - name: ingestion_day
+            description: "Дата ingest в Kafka (партиция DLQ)."
+          - name: payload_json
+            description: "Полный исходный JSON Kafka-сообщения."
+          - name: ingested_at

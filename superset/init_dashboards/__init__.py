@@ -20,13 +20,13 @@ from .trino import upsert_database
 DASHBOARD_TITLE = "Lab08 — Transaction Analytics"
 
 GOLD_TABLES: tuple[str, ...] = (
-    "transactions_by_hour",
-    "purchases_by_hour",
+    "transactions_by_hour_unified",
+    "purchases_by_hour_unified",
     "revenue_daily",
     "refunds_daily",
     "promo_codes_analysis",
     "promo_expired_usage_daily",
-    "cancellations_summary",
+    "cancellations_summary_unified",
     "user_cohorts",
     "dq_summary_daily",
 )

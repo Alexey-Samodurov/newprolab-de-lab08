@@ -1,19 +1,8 @@
 {#
   Silver: курсы валют в long-формате — одна строка на (rate_day, currency).
-
-  ADR (FIX_PLAN P1-9): wide-схема bronze (`rate_tgrk_punk`, `rate_tgrk_rub`)
-  плохо масштабируется на новые валюты — gold-модели вынуждены хардкодить
-  список валют в `CASE WHEN currency = ...`. Long-схема позволяет
-  `revenue_daily` джойнить транзакцию по `(event_day, currency)` без
-  изменений при добавлении новой валюты.
-
-  Семантика `rate_to_tgrk`: «сколько единиц <currency> за 1 TGRK».
-    amount_tgrk = amount / rate_to_tgrk
-  TGRK сам к себе = 1.0.
-
-  Materialized=incremental merge: верхняя модель `exchange_rates_daily`
-  пишет ровно одну строку на `run_date`, поэтому здесь добавляется/мерджится
-  максимум 3 записи за прогон — по числу валют.
+  Нужна, чтобы выручка джойнилась по валюте без хардкода списка валют:
+  добавление новой валюты не требует менять gold-модели.
+  rate_to_tgrk = «сколько единиц валюты за 1 TGRK», TGRK→TGRK = 1.
 #}
 {{ config(
     materialized='incremental',

@@ -6,10 +6,10 @@ Lab08 — локально разворачиваемый лейкхаус дл�
 
 - **Источники данных:** JSONL-файлы из Yandex Cloud S3 (бакет `npl-de18-lab8-data`) и поток событий из внешней Kafka.
 - **Хранилище:** Apache Hudi (Copy-on-Write) поверх MinIO, разложено по слоям `bronze / silver / gold`.
-- **Трансформации:** dbt-spark, режим `session`, incremental-модели через Hudi `merge` (часть gold по cancellations — `materialized='table'`).
+- **Трансформации:** dbt-spark (`method: session`, Hudi `merge`); + streaming-medallion — долгоживущий Spark-стрим, который держит `gold.*_live` витрины (NRT-слой Lambda).
 - **Каталог:** Hive Metastore с Postgres-бэкендом.
-- **Чтение:** Trino 470 (read-only), Apache Superset 4.x для дашбордов.
-- **Оркестрация:** Airflow 2.10.4 на `KubernetesExecutor`. Bronze S3 и медальон — посуточные DAG'и; Kafka — долгоживущий `SparkApplication` (speed-слой, опционально).
+- **Чтение:** Trino 470 (read-only), Apache Superset 4.x. Lambda-витрины собираются как Superset virtual datasets — UNION ALL settled (`gold.<x>`) + live (`gold.<x>_live`) с cutover по `max(event_day)`.
+- **Оркестрация:** Airflow 2.10.4 на `KubernetesExecutor`. Bronze S3 и медальон — посуточные DAG'и; Kafka-ingest и streaming-medallion — долгоживущие `SparkApplication`.
 - **Метрики:** kube-prometheus-stack, Spark Prometheus servlet, statsd-exporter для Airflow.
 
 Среда — Kubernetes (kind или Docker Desktop). Конфигурация декларативная: `helmfile.yaml` плюс raw-манифесты в `k8s/`.
@@ -139,21 +139,29 @@ flowchart LR
     YCS3[YC S3] --> S3B[bronze_s3_batch.py<br/>--source --ds]
     YCS3 --> REF[bronze_reference_batch.py]
     KFK[Kafka] --> Kmain[bronze_kafka_ingest.py]
+    BOOT[bootstrap_layer_skeletons.py<br/>one-shot]
 
     S3B --> HU[utils.hudi.write_hudi]
     REF --> HU
     Kmain --> HU
-    S3B --> WM[utils.watermark → bronze.ingest_watermarks]
+    BOOT --> HU
+    S3B --> WM["utils.watermark →<br/>bronze.ingest_watermarks_&lt;source&gt;"]
+    Kmain --> WMK[bronze.ingest_watermarks_kafka]
+    Kmain --> DLQ[bronze_dlq.late_events]
 
     HU --> MinIO[(MinIO: lake/, checkpoints/)]
     HU --> HMS[HMS]
 ```
 
-**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. CLI: `--source {transactions|cancellations|exchange_rates} --ds <YYYY-MM-DD> --src-root s3a://npl-de18-lab8-data`. Идемпотентный upsert по `composite_pk` (transactions) / `cancellation_id` / `rate_pk`. Watermark пишет **только** `transactions` — это снимает HMS race-condition при параллельном создании таблицы тремя подами.
+**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. Идемпотентный upsert по `composite_pk` / `cancellation_id` / `rate_pk`. Watermark пишется в шардированные таблицы `bronze.ingest_watermarks_<source>` — по одной на producer, без race-condition в общем timeline.
 
-**Reference (`bronze_reference_batch.py`)** — one-shot загрузка `users / test_users / promo_codes`. Запускается из `make up` через `make reference-batch`.
+**Reference (`bronze_reference_batch.py`)** — one-shot загрузка `users / test_users / promo_codes`.
 
-**Kafka (`bronze_kafka_ingest.py`)** — долгоживущий `SparkApplication` с `restartPolicy: Always`, `onFailureRetries: 10`. Чекпоинт на S3, exactly-once на уровне файлов через checkpoint + Hudi upsert. Dynamic allocation 1–2 executor. Запускается по необходимости (`make kafka-streaming-app`); основной аналитический контур работает без него.
+**Bootstrap (`bootstrap_layer_skeletons.py`)** — one-shot: создаёт пустые Hudi-таблицы под bronze, DLQ и `gold.*_live`. Последние нужны, чтобы Superset UNION ALL не падал до первого commit стрима.
+
+**Kafka (`bronze_kafka_ingest.py`)** — долгоживущий `SparkApplication`. Чекпоинт на S3, watermark консолидирован в `ingest_watermarks_kafka`. Запускается из `make up`.
+
+**Streaming medallion (`streaming_medallion.py`)** — второй долгоживущий стрим. Читает bronze как Hudi-stream, агрегирует и пишет в `gold.{transactions_by_hour,purchases_by_hour,cancellations_summary}_live` и `gold.exchange_rates_latest`. Routing по watermark: `event_day ≤ s3_high_watermark` отбрасывается (это уже у dbt). Single-writer на каждый output — нет конкурентов dbt.
 
 ### DAG `bronze_s3_ingest`
 
@@ -184,7 +192,7 @@ flowchart LR
     Gold --> Test[dbt_test]
 ```
 
-Расписание `30 2 * * *` (сдвиг даёт bronze ~30 мин на завершение). `bronze_ready` — `PythonSensor(mode=reschedule, poke=60s, timeout≈6m)` ждёт строку в `bronze.ingest_watermarks` за нужный `ds`. При таймауте DAGRun падает — видно в UI (без silent-skip).
+Расписание `30 2 * * *` (сдвиг даёт bronze ~30 мин на завершение). `bronze_ready` — `PythonSensor(mode=reschedule, poke=60s, timeout≈6m)` опрашивает 3 шарда `bronze.ingest_watermarks_{transactions,cancellations,exchange_rates}` на нужный `ds`. При таймауте DAGRun падает — видно в UI (без silent-skip).
 
 Каждая dbt-таска поднимает одноразовый `SparkApplication` (`restartPolicy: Never`, `mainApplicationFile=local:///opt/spark/jobs/run_dbt.py`). dbt-проект — из ConfigMap `dbt-project` (`/tmp/cm`), код задач — из `spark-jobs-code` (`/opt/spark/jobs`). AWS-ключи прокидываются через `envSecretKeyRefs` из `lab08-credentials`.
 
@@ -217,6 +225,12 @@ flowchart LR
     GCOH[user_cohorts]
     GDQ[dq_summary_daily]
   end
+  subgraph "gold.*_live (streaming, single-writer)"
+    GTBHL[transactions_by_hour_live]
+    GPBHL[purchases_by_hour_live]
+    GCANL[cancellations_summary_live]
+    GERL2[exchange_rates_latest]
+  end
   BTX --> STX
   BUSR --> STX
   BTU --> STX
@@ -244,6 +258,10 @@ Hudi-настройки: `compression=zstd`, `clean.policy=KEEP_LATEST_COMMITS`,
 В `transactions_clean` выставляются флаги качества: `is_user_missing`, `is_user_unknown`, `is_test_user`, `is_amount_invalid`, `is_revenue_eligible`, `is_promo_expired_at_use`.
 
 **Проверки качества:** около 30 generic dbt-тестов (`unique`, `not_null`, `accepted_values`) в `_silver.yml`, `_gold.yml`, `sources.yml`, плюс 2 singular — recon bronze vs silver и orphan-rate cancellations.
+
+### Lambda-unified BI-слой
+
+dbt держит settled-витрины за закрытые дни, streaming-medallion — `*_live` за свежие. Сшивает Superset через virtual dataset (`gold.*_unified`): UNION ALL settled и live, фильтр по `event_day > max(settled)`. Cutover автоматический. SQL в `superset/init_dashboards/datasets.py`. Не dbt view, потому что Trino-Hudi коннектор Hive views не читает.
 
 ---
 

@@ -152,7 +152,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         "slice_name": "KPI: Total Transactions",
         "description": "Общее число транзакций реальных пользователей (любой статус).",
         "viz_type": "big_number_total",
-        "datasource_id": ds["transactions_by_hour"],
+        "datasource_id": ds["transactions_by_hour_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "metric": simple_metric("tx_cnt", "SUM", "Transactions"),
@@ -168,7 +168,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
                        "refund_amount > суммы транзакции, или refund для не-purchase). "
                        "DQ-индикатор: высокое значение → проблема в источнике или маппинге.",
         "viz_type": "big_number_total",
-        "datasource_id": ds["cancellations_summary"],
+        "datasource_id": ds["cancellations_summary_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "metric": sql_metric(
@@ -185,7 +185,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         "slice_name": "KPI: Cancellations",
         "description": "Общее число отмен (по всем причинам, реальные пользователи).",
         "viz_type": "big_number_total",
-        "datasource_id": ds["cancellations_summary"],
+        "datasource_id": ds["cancellations_summary_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "metric": simple_metric("cancellations_cnt", "SUM", "Cancellations"),
@@ -243,7 +243,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "и Failed (правая ось) — две оси, чтобы низкочастотный Failed был виден."
         ),
         "viz_type": "mixed_timeseries",
-        "datasource_id": ds["transactions_by_hour"],
+        "datasource_id": ds["transactions_by_hour_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "x_axis": "event_day",
@@ -290,7 +290,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
             "две именованные серии рядом, без необходимости включать фильтр."
         ),
         "viz_type": "dist_bar",
-        "datasource_id": ds["transactions_by_hour"],
+        "datasource_id": ds["transactions_by_hour_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "metrics": [
@@ -321,7 +321,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         "description": "Только успешные покупки (status=completed AND transaction_type=purchase) "
                        "по часам суток, реальные пользователи.",
         "viz_type": "dist_bar",
-        "datasource_id": ds["purchases_by_hour"],
+        "datasource_id": ds["purchases_by_hour_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "metrics": [simple_metric("purchase_cnt", "SUM", "Purchases")],
@@ -342,7 +342,7 @@ def build_charts(client: SupersetClient, ds: dict[str, int | None]) -> dict[str,
         "slice_name": "Cancellations by Reason — отмены по дням и причинам",
         "description": "Динамика отмен по дням, разбивка по причинам — бары сгруппированы рядом.",
         "viz_type": "echarts_timeseries_bar",
-        "datasource_id": ds["cancellations_summary"],
+        "datasource_id": ds["cancellations_summary_unified"],
         "datasource_type": "table",
         "params": json.dumps({
             "x_axis": "cancel_day",

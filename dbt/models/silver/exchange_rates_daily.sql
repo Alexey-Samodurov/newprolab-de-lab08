@@ -1,6 +1,7 @@
 {#
-  Silver: Дневные курсы валют — берём последнюю котировку дня.
-  Базовая валюта TGRK, derive 1/rate для обратных переводов.
+  Silver: дневные курсы валют — последняя котировка за день.
+  Базовая валюта TGRK; считаем и обратный курс, чтобы конвертировать
+  суммы транзакций в TGRK на gold-слое.
 #}
 {{ config(
     materialized='incremental',
@@ -27,9 +28,6 @@ WITH ranked AS (
         ) AS rn
     FROM {{ source('bronze', 'exchange_rates') }}
     {% if is_incremental() %}
-      -- daily: курсы ровно за run_date. Если в этот день обновлений не было —
-      -- модель не запишет строку, gold/revenue_daily использует backward/forward-fill
-      -- (см. lab08/FIX_PLAN.md, P0-1, P1-1).
       WHERE timestamp >= unix_timestamp({{ run_date() }})
         AND timestamp <  unix_timestamp(date_add({{ run_date() }}, 1))
     {% endif %}

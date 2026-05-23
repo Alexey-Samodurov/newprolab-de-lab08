@@ -1,18 +1,8 @@
 {#
-  Gold: Сводка качества данных по дням (FIX_PLAN P1-10).
-
-  Считаем долю «грязных» записей в transactions_clean по run_date —
-  для алертов и дашборда DQ:
-    * is_user_missing       — у транзакции нет user_id
-    * is_user_unknown       — user_id не находится в users (zombie)
-    * is_amount_invalid     — amount NULL или <=0
-    * is_transaction_id_duplicated — несколько строк с одинаковым tx_id
-    * is_promo_expired_at_use      — использован промокод после expiry
-    * is_test_user                 — пользователь помечен как тестовый
-                                     (для разрезания «реальной» выручки)
-
-  ADR: смотрим только за event_day = run_date (daily-семантика),
-  catchup-прогон считает DQ за свой день — не пересматривает прошлое.
+  Gold: дневная сводка качества данных по транзакциям.
+  Доля «битых» записей за день — нет user_id, юзер-зомби, невалидная
+  сумма, дубль tx_id, просроченный промокод, тестовый пользователь.
+  Кормит DQ-дашборд и алерты; каждый прогон считает только свой день.
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge',
    unique_key='event_day',

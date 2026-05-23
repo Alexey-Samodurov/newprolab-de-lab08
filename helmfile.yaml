@@ -39,13 +39,6 @@ releases:
     values:
       - helm-values/minio-tenant.yaml
 
-  - name: hive-metastore-postgres
-    namespace: data-platform
-    chart: bitnami/postgresql
-    version: "15.5.38"
-    values:
-      - helm-values/hms-postgres.yaml
-
   - name: spark-operator
     namespace: data-platform
     chart: spark-operator/spark-operator
@@ -78,8 +71,6 @@ releases:
     namespace: data-platform
     chart: trino/trino
     version: "0.34.0"
-    needs:
-      - data-platform/hive-metastore-postgres
     values:
       - helm-values/trino.yaml
 

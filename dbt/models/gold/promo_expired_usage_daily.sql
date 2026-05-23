@@ -1,13 +1,8 @@
 {#
-  Gold: Доля транзакций с просроченным промокодом — по дню транзакции.
-
-  ADR (FIX_PLAN P1-3): метрика «промокод истёк на момент использования»
-  считается на уровне отдельной транзакции (флаг `is_promo_expired_at_use`
-  в transactions_clean), а не «когда-либо использовался после expiry»
-  (см. `promo_codes_analysis.used_after_expiry` — это per-promo-code и over-history).
-
-  Правило просрочки: created_ts >= expiry_date + 1 day (т.е. промокод
-  действителен в течение дня expiry_date включительно).
+  Gold: доля транзакций с просроченным промокодом — по дню транзакции.
+  Считается per-transaction: промокод протух, если created_ts наступил
+  строго после дня expiry_date. Метрика полезна для алертов на дыры
+  в валидации промо на бэке.
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge',
    unique_key='event_day',

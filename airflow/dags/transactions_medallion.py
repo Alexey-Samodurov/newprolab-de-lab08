@@ -1,6 +1,6 @@
 """DAG: daily medallion build (silver → gold → test) on top of bronze.
 
-Gated on ``bronze.ingest_watermarks`` via a ``PythonSensor`` in
+Gated on the ``bronze.ingest_watermarks_<source>`` shards via a ``PythonSensor`` in
 ``reschedule`` mode. The sensor holds the DAGRun in ``running`` state
 until the watermark for ``transactions|day=<ds>`` appears with non-zero
 rows. On timeout the DAGRun fails visibly. No retries, no silent skips.
@@ -67,8 +67,8 @@ def _bronze_ready(**context) -> bool:
     ds = context["ds"]
 
     rows = _trino_query_tolerant(
-        "SELECT rows_in_batch FROM hudi.bronze.ingest_watermarks "
-        f"WHERE table_name='{WATERMARK_PRODUCER}' "
+        f"SELECT rows_in_batch FROM hudi.bronze.ingest_watermarks_{WATERMARK_PRODUCER} "
+        f"WHERE watermark_id LIKE '{WATERMARK_PRODUCER}|s3|day=%' "
         f"  AND source_partition='day={ds}' "
         "ORDER BY committed_at DESC LIMIT 1"
     )
@@ -78,12 +78,16 @@ def _bronze_ready(**context) -> bool:
     log.info("bronze transactions ready ds=%s rows_in_batch=%s", ds, rows[0][0])
 
     for source in [s for s in BRONZE_SOURCES if s != WATERMARK_PRODUCER]:
-        table = source
-        check = _trino_query_tolerant(f"SELECT 1 FROM hudi.bronze.{table} LIMIT 1")
-        if not check:
-            log.info("bronze not ready ds=%s: bronze.%s is empty or missing — poke again", ds, table)
+        wm = _trino_query_tolerant(
+            f"SELECT rows_in_batch FROM hudi.bronze.ingest_watermarks_{source} "
+            f"WHERE watermark_id LIKE '{source}|s3|%' "
+            f"  AND source_partition IN ('day={ds}', 'snapshot') "
+            "ORDER BY committed_at DESC LIMIT 1"
+        )
+        if not wm:
+            log.info("bronze not ready ds=%s: %s s3-watermark missing — poke again", ds, source)
             return False
-        log.info("bronze %s ready ds=%s", table, ds)
+        log.info("bronze %s ready ds=%s rows_in_batch=%s", source, ds, wm[0][0])
 
     return True
 

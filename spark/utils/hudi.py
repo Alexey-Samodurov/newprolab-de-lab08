@@ -19,9 +19,13 @@ def hudi_opts(
     cluster_sort_cols: str | None = None,
     enable_record_index: bool = True,
     global_index: bool = False,
+    index_type: str | None = None,
     shuffle_parallelism: int = 4,
     enable_column_stats: bool = False,
     enable_hive_sync: bool = True,
+    hoodie_table_name: str | None = None,
+    enable_metadata: bool = True,
+    multi_writer: bool = False,
 ) -> dict:
     """Build Hudi writer options for a CoW table with HMS sync.
 
@@ -40,7 +44,16 @@ def hudi_opts(
         enable_record_index: Enable Hudi RECORD_INDEX for fast upserts.
         global_index: Use GLOBAL_BLOOM index across all partitions. Needed
             when the recordkey can move across partitions between batches.
-            Mutually exclusive with ``enable_record_index``.
+            Mutually exclusive with ``enable_record_index``. Kept for
+            backward compatibility; prefer ``index_type``.
+        index_type: Explicit Hudi index type. One of ``SIMPLE``,
+            ``GLOBAL_SIMPLE``, ``BLOOM``, ``GLOBAL_BLOOM``,
+            ``RECORD_INDEX``. When provided overrides
+            ``enable_record_index`` / ``global_index`` defaults. Use
+            ``SIMPLE`` for partition-bound recordkeys with a couple of
+            writers per table and ``GLOBAL_SIMPLE`` when the same
+            recordkey may move across partitions and dedup must hold
+            globally (cancellations, exchange_rates).
         shuffle_parallelism: Parallelism for upsert/insert/bulk/delete shuffles.
         enable_column_stats: Toggle column-stats metadata index.
         enable_hive_sync: Toggle Hive Metastore sync.
@@ -57,7 +70,7 @@ def hudi_opts(
         cluster_sort_cols = partition_field or pk
 
     opts: dict[str, str] = {
-        "hoodie.table.name": f"{db}_{full_table}",
+        "hoodie.table.name": hoodie_table_name or f"{db}_{full_table}",
         "hoodie.datasource.write.table.type": "COPY_ON_WRITE",
         "hoodie.datasource.write.recordkey.field": pk,
         "hoodie.datasource.write.precombine.field": precombine,
@@ -93,27 +106,37 @@ def hudi_opts(
         "hoodie.clustering.inline": "false",
         "hoodie.clustering.async.enabled": "false",
         "hoodie.clustering.async.max.commits": "4",
-        "hoodie.write.concurrency.mode": "optimistic_concurrency_control",
+        "hoodie.write.concurrency.mode": (
+            "single_writer" if multi_writer else "single_writer"
+        ),
         "hoodie.write.lock.provider": "org.apache.hudi.client.transaction.lock.InProcessLockProvider",
         "hoodie.cleaner.policy.failed.writes": "LAZY",
         "hoodie.clustering.plan.strategy.target.file.max.bytes": str(128 * 1024 * 1024),
         "hoodie.clustering.plan.strategy.small.file.limit": str(100 * 1024 * 1024),
         "hoodie.clustering.plan.strategy.sort.columns": cluster_sort_cols,
-        "hoodie.metadata.enable": "true",
+        "hoodie.metadata.enable": "true" if enable_metadata else "false",
         "hoodie.metadata.compact.max.delta.commits": "20",
-        "hoodie.metadata.index.column.stats.enable": "true" if enable_column_stats else "false",
+        "hoodie.metadata.index.column.stats.enable": "true" if (enable_metadata and enable_column_stats) else "false",
     }
     if enable_column_stats:
         opts["hoodie.metadata.index.column.stats.column.list"] = column_stats_cols
 
-    if global_index:
-        opts["hoodie.index.type"] = "GLOBAL_BLOOM"
+    resolved_type = (index_type or "").upper() or None
+    if resolved_type is None:
+        if global_index:
+            resolved_type = "GLOBAL_BLOOM"
+        elif enable_record_index and not partition_field:
+            resolved_type = "RECORD_INDEX"
+        else:
+            resolved_type = "BLOOM"
+
+    opts["hoodie.index.type"] = resolved_type
+    if resolved_type == "GLOBAL_BLOOM":
         opts["hoodie.bloom.index.update.partition.path"] = "true"
-    elif enable_record_index and not partition_field:
-        opts["hoodie.index.type"] = "RECORD_INDEX"
+    elif resolved_type == "GLOBAL_SIMPLE":
+        opts["hoodie.simple.index.update.partition.path"] = "true"
+    elif resolved_type == "RECORD_INDEX":
         opts["hoodie.metadata.record.level.index.enable"] = "true"
-    else:
-        opts["hoodie.index.type"] = "BLOOM"
 
     return opts
 

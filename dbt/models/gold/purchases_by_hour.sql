@@ -1,6 +1,7 @@
 {#
-  Gold: Покупки (purchase + completed) по часам.
-  ADR: считаем покупкой только status='completed' AND transaction_type='purchase'.
+  Gold: успешные покупки по часам дня.
+  Только status='completed' и transaction_type='purchase' — это и есть
+  реальная выручка в штуках и нативной сумме. Кормит почасовой дашборд.
 #}
 {{ config(materialized='incremental', file_format='hudi', incremental_strategy='merge', unique_key='pk',
    options={'primaryKey': 'pk', 'preCombineField': 'updated_at', 'type': 'cow'}) }}

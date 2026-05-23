@@ -44,7 +44,8 @@ flowchart LR
 | Spark driver / executor (bronze transactions) | 1 / 1200m | 1g / 1g (+256m/512m overhead), 2 executors | — | живут только на время DAGRun |
 | Spark driver / executor (bronze cancellations, exchange_rates) | 1 / 1200m | 512m / 512m (+128m/256m overhead), 1 executor | — | живут только на время DAGRun |
 | Spark driver / executor (dbt) | 1 / 1200m | 1 Gi / 2 Gi (+overhead) | — | живут только на время DAGRun |
-| Spark driver / executor (Kafka streaming, опционально) | 1 / 1200m | 1 Gi + 256 Mi / 2 Gi + 512 Mi, 1–2 executor | — | 24/7 пока запущен |
+| Spark driver / executor (Kafka streaming) | 1 / 1200m | 1 Gi + 256 Mi / 2 Gi + 512 Mi, 1–2 executor | — | 24/7 |
+| Spark driver / executor (streaming-medallion) | 1 / 1200m | 1 Gi + 256 Mi / 2 Gi + 512 Mi, 1–2 executor | — | 24/7 |
 
 ### Программные
 
@@ -121,7 +122,7 @@ flowchart LR
 | dbt defaults | `dbt/dbt_project.yml` | `incremental` / `hudi` / `merge` (gold cancellations — `table`) | стратегия dbt-моделей |
 | `vars.base_currency` | `dbt/dbt_project.yml` | `TGRK` | базовая валюта конверсии |
 | `BRONZE_RESOURCE_PROFILES` | `airflow/dags/_common.py` | per source (transactions/cancellations/exchange_rates) | ресурсы Spark на ingest-task |
-| `restartPolicy` | `k8s/spark-applications/bronze-kafka-ingest.yaml` | `Always`, `onFailureRetries: 10` | поведение Kafka-стрима при сбое |
+| `restartPolicy` | `k8s/spark-applications/bronze-kafka-ingest.yaml`, `streaming-medallion.yaml` | `Always`, `onFailureRetries: 10` | поведение долгоживущих стримов при сбое |
 | `schedule` (DAG) | `airflow/dags/bronze_s3_ingest.py` | `0 2 * * *` | bronze ingest (T-1) |
 | `schedule` (DAG) | `airflow/dags/transactions_medallion.py` | `30 2 * * *` | dbt silver → gold → test |
 | `KIND_CONTEXT` | `Makefile` | `docker-desktop` | текущий kubectl-context |
@@ -156,7 +157,7 @@ flowchart TD
     F --> G([Готово])
 ```
 
-`make up` внутри последовательно выполняет: создание namespaces и секретов, сборку образов, `helmfile sync`, инициализацию HMS, создание ConfigMap'ов, применение reference-batch, unpause DAG'ов и `bootstrap-pipeline` (ждёт первого наполнения gold). Kafka speed-слой не запускается автоматически.
+`make up` внутри последовательно выполняет: namespaces и секреты, сборку образов, postgres → hms-apply, `helmfile sync`, ConfigMap'ы, `bootstrap-skeletons` (пустые bronze/DLQ/`*_live`), `kafka-streaming-app` и `streaming-medallion-app`, unpause DAG'ов, `bootstrap-pipeline` (ждёт gold) и `superset-init`. HMS-rollout ждётся прямо перед первым Spark-джобом — это даёт ему стартовать параллельно с helmfile-rollout-ами.
 
 ### Пошагово
 
@@ -215,7 +216,9 @@ flowchart TD
 | `make images` | сборка трёх Docker-образов (skip, если уже собраны) |
 | `make spark-code` / `make dbt-configmap` | пересоздать ConfigMap с кодом |
 | `make reference-batch` | one-shot bronze-reference-batch |
-| `make kafka-streaming-app` | поднять Kafka speed-слой (опционально) |
+| `make bootstrap-skeletons` | one-shot создание пустых bronze/DLQ/`gold.*_live` Hudi-таблиц |
+| `make kafka-streaming-app` | поднять Kafka speed-слой |
+| `make streaming-medallion-app` | поднять streaming-medallion (NRT gold) |
 | `make airflow-dags` | скопировать DAG-файлы в scheduler pod |
 | `make airflow-trigger-bronze` | ручной триггер `bronze_s3_ingest` |
 | `make airflow-trigger-medallion` | ручной триггер `transactions_medallion` |
@@ -243,7 +246,7 @@ flowchart TD
 - Изменения схемы HMS Postgres выполняются через MetaStore upgrade (вне скоупа Lab08).
 - dbt-incremental поверх Hudi `merge` совместим вперёд при добавлении nullable-колонок.
 
-Batch SparkApps (bronze, dbt) создаются Airflow на каждый запуск — апгрейд образа подхватывается следующим DAGRun без ручных действий. Kafka-стрим (если поднят): после обновления образа удалить ресурс и пересоздать через `make kafka-streaming-app`; checkpoint на S3 сохраняется.
+Batch SparkApps (bronze, dbt) создаются Airflow на каждый запуск — апгрейд образа подхватывается следующим DAGRun без ручных действий. Долгоживущие стримы (`bronze-kafka-ingest`, `streaming-medallion`): после обновления образа удалить ресурс и пересоздать через соответствующий `make`-таргет; checkpoint на S3 сохраняется и стрим возобновится с того же offset.
 
 ---
 
@@ -270,12 +273,12 @@ Batch SparkApps (bronze, dbt) создаются Airflow на каждый за�
    helm -n data-platform history <release>
    helm -n data-platform rollback <release> <REVISION>
    ```
-4. Если поднят Kafka-стрим — пересоздать:
+4. Если поднят долгоживущий стрим — пересоздать:
    ```bash
-   kubectl -n spark-jobs delete sparkapplication bronze-kafka-ingest --ignore-not-found
-   make kafka-streaming-app
+   kubectl -n spark-jobs delete sparkapplication bronze-kafka-ingest streaming-medallion --ignore-not-found
+   make kafka-streaming-app streaming-medallion-app
    ```
-   Чекпойнт на S3 переживает rollback — стрим возобновится с того же offset.
+   Чекпойнты на S3 переживают rollback — стримы возобновятся с того же offset.
 5. Проверить: `make status`, `make verify-trino`, прогон DAG'ов.
 
 Откат с потерей данных — это `make down`: удаляет PVC MinIO и базу HMS, Hudi-таблицы и каталог метаданных пропадают.

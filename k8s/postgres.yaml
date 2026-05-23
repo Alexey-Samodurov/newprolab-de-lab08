@@ -1,0 +1,119 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: data-platform
+type: Opaque
+stringData:
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: postgres
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-initdb
+  namespace: data-platform
+data:
+  01-init-databases.sh: |
+    #!/bin/bash
+    set -e
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      CREATE USER hive WITH PASSWORD 'hive';
+      CREATE DATABASE metastore OWNER hive;
+      GRANT ALL PRIVILEGES ON DATABASE metastore TO hive;
+
+      CREATE USER airflow WITH PASSWORD 'airflow';
+      CREATE DATABASE airflow OWNER airflow;
+      GRANT ALL PRIVILEGES ON DATABASE airflow TO airflow;
+
+      CREATE USER superset WITH PASSWORD 'superset';
+      CREATE DATABASE superset OWNER superset;
+      GRANT ALL PRIVILEGES ON DATABASE superset TO superset;
+    EOSQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: data-platform
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  selector:
+    app: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: data-platform
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        fsGroup: 70
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 350m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

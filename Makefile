@@ -1,7 +1,8 @@
-.PHONY: help check up down ns secrets diff status spark-image hms \
+.PHONY: help check up down ns secrets diff status spark-image hms hms-apply hms-wait postgres \
         spark-code dbt-configmap airflow-dags airflow-trigger-bronze airflow-trigger-medallion superset-init \
         ingress hosts images airflow-image hms-image rbac airflow-unpause wait-airflow ensure-buckets verify-trino \
         bootstrap-pipeline kafka-streaming-app reference-batch \
+        bootstrap-skeletons streaming-medallion-app \
         monitoring monitoring-dashboards
 
 KIND_CONTEXT ?= docker-desktop
@@ -20,7 +21,9 @@ help:
 	@echo "  make hms                      - применить hive-metastore deployment"
 	@echo "  make rbac                     - применить spark-rbac, airflow-rbac"
 	@echo "  make reference-batch          - применить (или перезапустить) one-shot bronze-reference-batch SparkApplication"
+	@echo "  make bootstrap-skeletons      - one-shot: создать пустые Hudi-таблицы bronze.* + bronze_dlq.late_events + gold.*_live"
 	@echo "  make kafka-streaming-app      - применить bronze-kafka-ingest SparkApplication (speed layer, опционально)"
+	@echo "  make streaming-medallion-app  - применить streaming-medallion SparkApplication (live gold-агрегаты, ADR-004)"
 	@echo "  make ensure-buckets           - убедиться что lake bucket существует (для существующего MinIO)"
 	@echo "  make spark-code               - пересоздать ConfigMap'ы spark-jobs-code и spark-utils-code"
 	@echo "  make dbt-configmap            - пересоздать ConfigMap dbt-project из dbt/"
@@ -73,15 +76,22 @@ up: ns secrets images
 	helmfile --quiet -l name=minio-tenant sync
 	$(MAKE) ensure-buckets
 	$(MAKE) airflow-dags
+	@echo ">>> Shared PostgreSQL..."
+	$(MAKE) postgres
+	@echo "    Ожидаю postgres..."
+	kubectl -n data-platform wait --for=condition=ready pod -l app=postgres --timeout=300s
+	$(MAKE) hms-apply
 	@echo ">>> [2/3] Остальная инфраструктура (helmfile sync)..."
 	helmfile --quiet sync
-	@echo "    Ожидаю hive-metastore-postgresql..."
-	kubectl -n data-platform wait --for=condition=ready pod -l app.kubernetes.io/instance=hive-metastore-postgres --timeout=300s
-	$(MAKE) hms
 	$(MAKE) rbac
 	$(MAKE) spark-code
 	$(MAKE) dbt-configmap
+	@echo "    Ожидаю Hive Metastore..."
+	$(MAKE) hms-wait
 	$(MAKE) reference-batch
+	$(MAKE) bootstrap-skeletons
+	$(MAKE) kafka-streaming-app
+	$(MAKE) streaming-medallion-app
 	$(MAKE) ingress
 	$(MAKE) monitoring
 	@echo "    Ожидаю Airflow scheduler..."
@@ -103,9 +113,17 @@ up: ns secrets images
 	@echo "  (Если *.lab08.local не резолвятся — сделай 'make hosts')"
 	@echo "================================================================"
 
-hms:
+hms: hms-apply hms-wait
+
+hms-apply:
 	kubectl apply -f k8s/hive-metastore.yaml >/dev/null
+
+hms-wait:
 	kubectl -n data-platform rollout status deployment/hive-metastore --timeout=300s
+
+postgres:
+	kubectl apply -f k8s/postgres.yaml >/dev/null
+	kubectl -n data-platform rollout status statefulset/postgres --timeout=300s
 
 rbac:
 	kubectl apply -f k8s/spark-rbac.yaml >/dev/null
@@ -122,6 +140,23 @@ kafka-streaming-app:
 	@echo ">>> Применяю bronze-kafka-ingest SparkApplication..."
 	@echo "    ВНИМАНИЕ: убедись, что Kafka-брокер из Secret lab08-credentials (KAFKA_BOOTSTRAP_SERVERS) доступен изнутри кластера."
 	kubectl apply -f k8s/spark-applications/bronze-kafka-ingest.yaml >/dev/null
+
+bootstrap-skeletons:
+	@echo ">>> Применяю bootstrap-layer-skeletons (one-shot: создаёт пустые Hudi-таблицы bronze.* + bronze_dlq.late_events + gold.*_live placeholders)..."
+	-kubectl -n spark-jobs delete sparkapplication bootstrap-layer-skeletons --ignore-not-found --wait=true >/dev/null 2>&1
+	kubectl apply -f k8s/spark-applications/bootstrap-layer-skeletons.yaml >/dev/null
+	@echo "    Ожидаю Completed (макс 5 мин)..."
+	@for i in $$(seq 1 60); do \
+	  st=$$(kubectl -n spark-jobs get sparkapp bootstrap-layer-skeletons -o jsonpath='{.status.applicationState.state}' 2>/dev/null); \
+	  if [ "$$st" = "COMPLETED" ]; then echo "    bootstrap-layer-skeletons COMPLETED"; exit 0; fi; \
+	  if [ "$$st" = "FAILED" ]; then echo "    bootstrap-layer-skeletons FAILED"; exit 1; fi; \
+	  sleep 5; \
+	done; \
+	echo "    timeout ожидания bootstrap-layer-skeletons"; exit 1
+
+streaming-medallion-app:
+	@echo ">>> Применяю streaming-medallion SparkApplication (ADR-004 live gold-агрегаты)..."
+	kubectl apply -f k8s/spark-applications/streaming-medallion.yaml >/dev/null
 
 ensure-buckets:
 	@echo ">>> Создаю/проверяю MinIO buckets..."
@@ -150,6 +185,8 @@ down:
 	-kubectl -n spark-jobs delete scheduledsparkapplication --all --ignore-not-found --wait=false
 	@echo ">>> 2/6 Удаляю ручные манифесты (HMS / SparkApps / Ingress / RBAC / secrets)..."
 	-kubectl delete -f k8s/spark-applications/bronze-kafka-ingest.yaml --ignore-not-found
+	-kubectl delete -f k8s/spark-applications/streaming-medallion.yaml --ignore-not-found
+	-kubectl delete -f k8s/spark-applications/bootstrap-layer-skeletons.yaml --ignore-not-found
 	-kubectl delete -f k8s/spark-applications/bronze-reference-batch.yaml --ignore-not-found
 	-kubectl delete -f k8s/hive-metastore.yaml --ignore-not-found
 	-kubectl delete -f k8s/ingress.yaml --ignore-not-found
