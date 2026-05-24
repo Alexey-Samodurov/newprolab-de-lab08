@@ -4,7 +4,7 @@
 
 ## Подход
 
-Развёртывание декларативное: `helmfile.yaml` плюс raw-манифесты в `k8s/` плюс три собственных Docker-образа. Поверх — единый `Makefile`, который оркестрирует все шаги (`make up` / `make down`). Среда одна — локальный кластер; per-environment values не предусмотрены.
+Развёртывание декларативное: `helmfile.yaml` (8 релизов) плюс raw-манифесты в `k8s/` (общий `postgres`, `hive-metastore`, RBAC, SparkApplication-ы) плюс три собственных Docker-образа. Поверх — единый `Makefile`, который оркестрирует все шаги (`make up` / `make down`). Среда одна — локальный кластер; per-environment values не предусмотрены.
 
 ```mermaid
 flowchart LR
@@ -40,9 +40,9 @@ flowchart LR
 |---|---|---|---|---|
 | Docker Desktop / kind host | ≥4 vCPU | **≥16 GB выделено Docker'у** | ≥40 GB на образы и PVC | HTTPS наружу (YC S3, Helm repo, Docker Hub), доступ к Kafka |
 | MinIO PVC | — | — | 20 Gi (1 pool × 1 server) | — |
-| HMS Postgres | 100m / 500m | 256 Mi / 512 Mi | PVC дефолтного StorageClass | — |
+| Postgres (shared) | 100m / 500m | 256 Mi / 512 Mi | PVC дефолтного StorageClass | — |
 | Spark driver / executor (bronze transactions) | 1 / 1200m | 1g / 1g (+256m/512m overhead), 2 executors | — | живут только на время DAGRun |
-| Spark driver / executor (bronze cancellations, exchange_rates) | 1 / 1200m | 512m / 512m (+128m/256m overhead), 1 executor | — | живут только на время DAGRun |
+| Spark driver / executor (bronze cancellations, exchange_rates) | 1 / 1200m | 712m / 1g (+128m/128m overhead), 1 executor | — | живут только на время DAGRun |
 | Spark driver / executor (dbt) | 1 / 1200m | 1 Gi / 2 Gi (+overhead) | — | живут только на время DAGRun |
 | Spark driver / executor (Kafka streaming) | 1 / 1200m | 1 Gi + 256 Mi / 2 Gi + 512 Mi, 1–2 executor | — | 24/7 |
 | Spark driver / executor (streaming-medallion) | 1 / 1200m | 1 Gi + 256 Mi / 2 Gi + 512 Mi, 1–2 executor | — | 24/7 |
@@ -68,7 +68,6 @@ flowchart LR
 | `lab08/hive-metastore` | `3.0.0-pg2` |
 | ingress-nginx chart | `4.11.0` |
 | minio-operator / tenant chart | `6.0.4` |
-| bitnami/postgresql chart | `15.5.38` |
 | spark-operator chart | `1.4.6` |
 | apache-airflow chart | `1.15.0` (Airflow 2.10.4) |
 | trino chart | `0.34.0` (Trino 470) |
@@ -157,7 +156,7 @@ flowchart TD
     F --> G([Готово])
 ```
 
-`make up` внутри последовательно выполняет: namespaces и секреты, сборку образов, postgres → hms-apply, `helmfile sync`, ConfigMap'ы, `bootstrap-skeletons` (пустые bronze/DLQ/`*_live`), `kafka-streaming-app` и `streaming-medallion-app`, unpause DAG'ов, `bootstrap-pipeline` (ждёт gold) и `superset-init`. HMS-rollout ждётся прямо перед первым Spark-джобом — это даёт ему стартовать параллельно с helmfile-rollout-ами.
+`make up` внутри последовательно выполняет: namespaces и секреты, сборку образов, MinIO (operator+tenant), buckets, копирование DAG-файлов, общий `postgres` (raw-манифест `k8s/postgres.yaml`, БД для HMS / Airflow / Superset), `hms-apply` → `helmfile sync`, RBAC, ConfigMap'ы (`spark-jobs-code` + `dbt-project`), ожидание HMS, `reference-batch`, `bootstrap-skeletons` (пустые bronze/DLQ/`*_live`), `kafka-streaming-app`, `streaming-medallion-app`, ingress + monitoring, unpause DAG'ов, `bootstrap-pipeline` (ждёт gold) и `superset-init`.
 
 ### Пошагово
 

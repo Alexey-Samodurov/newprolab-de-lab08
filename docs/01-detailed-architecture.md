@@ -7,7 +7,7 @@ Lab08 — локально разворачиваемый лейкхаус дл�
 - **Источники данных:** JSONL-файлы из Yandex Cloud S3 (бакет `npl-de18-lab8-data`) и поток событий из внешней Kafka.
 - **Хранилище:** Apache Hudi (Copy-on-Write) поверх MinIO, разложено по слоям `bronze / silver / gold`.
 - **Трансформации:** dbt-spark (`method: session`, Hudi `merge`); + streaming-medallion — долгоживущий Spark-стрим, который держит `gold.*_live` витрины (NRT-слой Lambda).
-- **Каталог:** Hive Metastore с Postgres-бэкендом.
+- **Каталог:** Hive Metastore поверх общего Postgres (raw-манифест `k8s/postgres.yaml`, одна БД на HMS / Airflow / Superset).
 - **Чтение:** Trino 470 (read-only), Apache Superset 4.x. Lambda-витрины собираются как Superset virtual datasets — UNION ALL settled (`gold.<x>`) + live (`gold.<x>_live`) с cutover по `max(event_day)`.
 - **Оркестрация:** Airflow 2.10.4 на `KubernetesExecutor`. Bronze S3 и медальон — посуточные DAG'и; Kafka-ingest и streaming-medallion — долгоживущие `SparkApplication`.
 - **Метрики:** kube-prometheus-stack, Spark Prometheus servlet, statsd-exporter для Airflow.
@@ -100,7 +100,7 @@ flowchart LR
 |---|---|---|
 | ingress-nginx | 4.11.0 | `ingress-nginx` |
 | MinIO Operator + Tenant | 6.0.4 | `minio-operator`, `storage` |
-| HMS Postgres (Bitnami) | 15.5.38 | `data-platform` |
+| Postgres (shared: HMS / Airflow / Superset) | 16 (raw manifest) | `data-platform` |
 | Hive Metastore | 3.0.0 (raw manifest) | `data-platform` |
 | Spark Operator | 1.4.6 | `data-platform` |
 | Airflow | chart 1.15.0 (Airflow 2.10.4) | `data-platform` |
@@ -153,7 +153,7 @@ flowchart LR
     HU --> HMS[HMS]
 ```
 
-**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. Идемпотентный upsert по `composite_pk` / `cancellation_id` / `rate_pk`. Watermark пишется в шардированные таблицы `bronze.ingest_watermarks_<source>` — по одной на producer, без race-condition в общем timeline.
+**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. Идемпотентный upsert по `composite_pk` / `cancellation_pk` / `rate_pk`. Derived-колонки (`event_day`, `ingestion_day`, PK, `ingested_at`) считаются единым модулем `spark/utils/bronze_transforms.py` — общим с Kafka-writer'ом, чтобы партиционирование и ключи были байт-в-байт одинаковыми. Для transactions/cancellations выполняется cutover-merge с Kafka-резидуалом и `insert_overwrite` на партицию (S3 — источник истины для своих партиций). Cancellations партиционируются по `ingestion_day`, а не по `event_day` — late-arriving отмена не конкурирует с уже закрытой батч-партицией (см. ADR-004). Watermark пишет каждый источник в свой шард `bronze.ingest_watermarks_<source>` — single-writer per shard, без race-condition.
 
 **Reference (`bronze_reference_batch.py`)** — one-shot загрузка `users / test_users / promo_codes`.
 
@@ -173,15 +173,15 @@ flowchart LR
     Check -->|day missing| Skip([skip])
 ```
 
-Расписание `0 2 * * *`, `start_date=2026-04-24`, `catchup=True`, `max_active_runs=1`, T-1 (грузит `ds = вчера`). `check_source_day` — ShortCircuit-гейт на наличие S3-партиции: если директории нет, слот сразу skipped без ретраев. Три bronze-таски запускаются параллельно одноразовыми `SparkApplication` через `SparkKubernetesOperator`.
+Расписание `0 2 * * *`, `start_date=2026-04-24`, `catchup=True`, `max_active_runs=1`, T-1 (грузит `ds = вчера`). `check_source_day` — ShortCircuit-гейт на наличие S3-партиции: если директории нет, слот сразу skipped без ретраев. Три bronze-таски запускаются параллельно одноразовыми `SparkApplication` через `SparkKubernetesOperator`. Каждая после успешного upsert пишет строку в свой шард `bronze.ingest_watermarks_<source>`.
 
 Ресурсные профили per source (`_common.BRONZE_RESOURCE_PROFILES`):
 
 | Источник | Driver | Executor | Instances |
 |---|---|---|---|
-| `transactions` | 1g + 256m | 1g + 512m | 2 (fixed) |
-| `cancellations` | 512m + 128m | 512m + 256m | 1 |
-| `exchange_rates` | 512m + 128m | 512m + 256m | 1 |
+| `transactions` | 1g + 256m | 1g + 512m | 2 (dyn 2–3) |
+| `cancellations` | 712m + 128m | 1g + 128m | 1 |
+| `exchange_rates` | 712m + 128m | 1g + 128m | 1 |
 
 ### DAG `transactions_medallion`
 
@@ -192,7 +192,7 @@ flowchart LR
     Gold --> Test[dbt_test]
 ```
 
-Расписание `30 2 * * *` (сдвиг даёт bronze ~30 мин на завершение). `bronze_ready` — `PythonSensor(mode=reschedule, poke=60s, timeout≈6m)` опрашивает 3 шарда `bronze.ingest_watermarks_{transactions,cancellations,exchange_rates}` на нужный `ds`. При таймауте DAGRun падает — видно в UI (без silent-skip).
+Расписание `30 2 * * *` (сдвиг даёт bronze ~30 мин на завершение). `bronze_ready` — `PythonSensor(mode=reschedule, poke=60s, timeout≈6m)` опрашивает все три шарда `bronze.ingest_watermarks_{transactions,cancellations,exchange_rates}` на нужный `ds`. При таймауте DAGRun падает — видно в UI (без silent-skip).
 
 Каждая dbt-таска поднимает одноразовый `SparkApplication` (`restartPolicy: Never`, `mainApplicationFile=local:///opt/spark/jobs/run_dbt.py`). dbt-проект — из ConfigMap `dbt-project` (`/tmp/cm`), код задач — из `spark-jobs-code` (`/opt/spark/jobs`). AWS-ключи прокидываются через `envSecretKeyRefs` из `lab08-credentials`.
 
@@ -253,7 +253,7 @@ flowchart LR
 
 Профиль `lab08`, адаптер `dbt-spark` 1.8.0 в режиме `method: session`. Дефолты: `materialized=incremental`, `file_format=hudi`, `incremental_strategy=merge`, `location_root=s3a://lake/{silver,gold}`. Базовая валюта (`vars.base_currency`) — `TGRK`. Витрины по cancellations (`cancellations_summary`, `refunds_daily`) — `materialized='table'` (десятки строк, безопаснее пересобирать целиком).
 
-Hudi-настройки: `compression=zstd`, `clean.policy=KEEP_LATEST_COMMITS`, `commits.retained=2`, inline clustering на silver, column-stats индекс по `event_day, hour_of_day, is_test_user`.
+Hudi-настройки: CoW + HMS sync, `compression=zstd`, `clean.policy=KEEP_LATEST_COMMITS`, `commits.retained=10`, async clean, archive off с `keep.min/max.commits = 30/40`. Индексы: `SIMPLE` для partition-bound PK (transactions), `GLOBAL_SIMPLE` там, где record-key может «переезжать» между партициями (cancellations, exchange_rates, gold-витрины). Concurrency — single-writer per shard + `InProcessLockProvider`.
 
 В `transactions_clean` выставляются флаги качества: `is_user_missing`, `is_user_unknown`, `is_test_user`, `is_amount_invalid`, `is_revenue_eligible`, `is_promo_expired_at_use`.
 
@@ -287,9 +287,7 @@ sequenceDiagram
     Drv->>Drv: enrich (composite_pk, event_day, ingested_at)
     Drv->>MinIO: write_hudi(upsert)
     Drv->>HMS: register / alter
-    alt source == transactions
-        Drv->>W: write_watermark(ds)
-    end
+    Drv->>W: write_watermark(ds) per source shard
     Note over Drv: retry / clear DAGRun → идемпотентный upsert
 ```
 

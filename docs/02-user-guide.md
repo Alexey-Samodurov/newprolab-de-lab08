@@ -101,8 +101,8 @@ flowchart LR
 
 Цель — прогнать `bronze → silver → gold → tests` для конкретного `ds` (T-1).
 
-1. Триггернуть bronze: `make airflow-trigger-bronze` либо «Trigger DAG» у `bronze_s3_ingest`. Внутри — `check_source_day` (ShortCircuit на наличие `day=<ds>/` в S3) → 3 параллельные таски `bronze_transactions / bronze_cancellations / bronze_exchange_rates`. Watermark пишет только transactions.
-2. Триггернуть медальон: `make airflow-trigger-medallion` либо «Trigger DAG» у `transactions_medallion`. Сенсор `bronze_ready` (`reschedule`, poke 60s) ждёт watermark и запускает `dbt_silver → dbt_gold → dbt_test`.
+1. Триггернуть bronze: `make airflow-trigger-bronze` либо «Trigger DAG» у `bronze_s3_ingest`. Внутри — `check_source_day` (ShortCircuit на наличие `day=<ds>/` в S3) → 3 параллельные таски `bronze_transactions / bronze_cancellations / bronze_exchange_rates`. Каждая после upsert пишет в свой шард `bronze.ingest_watermarks_<source>`.
+2. Триггернуть медальон: `make airflow-trigger-medallion` либо «Trigger DAG» у `transactions_medallion`. Сенсор `bronze_ready` (`reschedule`, poke 60s) ждёт все три шарда watermark и запускает `dbt_silver → dbt_gold → dbt_test`.
 3. По расписанию оба DAG'а запускаются автоматически: bronze в `0 2 * * *`, медальон в `30 2 * * *` (T-1 от текущего дня).
 
 Если за `ds` нет данных в S3 — `bronze_s3_ingest` skipped (это легальный исход), медальон в этом случае упадёт по таймауту сенсора.
@@ -151,81 +151,36 @@ SELECT * FROM hudi.bronze.ingest_watermarks_transactions ORDER BY committed_at D
 
 ## Модель данных
 
-### Слои (medallion)
+Бизнес-логика, бизнес-определения, обработка грязных кейсов, layout
+silver/gold и live-витрины — `04-data-modeling.md`.
 
-- **bronze.*** — сырые данные плюс технические поля (`composite_pk`, `event_day`, `ingested_at`). Hudi upsert, exactly-once на уровне файлов через checkpoint.
-- **silver.*** — типизация, дедуп, флаги качества: `is_user_missing`, `is_user_unknown`, `is_test_user`, `is_amount_invalid`, `is_revenue_eligible`, `is_promo_expired_at_use`.
-- **gold.*** — settled-витрины: `transactions_by_hour`, `purchases_by_hour`, `revenue_daily`, `refunds_daily`, `cancellations_summary`, `promo_codes_analysis`, `promo_expired_usage_daily`, `user_cohorts`, `dq_summary_daily`. Пишутся dbt-ом за дни ≤ `s3_high_watermark`.
-- **gold.*_live** — NRT-копии 3-х витрин + `exchange_rates_latest`, пишутся `streaming_medallion`. Дашборд видит обе стороны через Superset virtual dataset `gold.*_unified` (UNION с cutover-фильтром).
+С эксплуатационной точки зрения важно знать:
 
-### Бизнес-правила
-
-| Правило | Реализация |
-|---|---|
-| Дубли `transaction_id` (~5%) разрешаются через `composite_pk = concat_ws('|', transaction_id, created_at, user_id)` | bronze ingest, Hudi record_key |
-| `is_test_user=true` исключаются из gold-витрин | silver и gold-фильтры |
-| `is_revenue_eligible=false` (нулевые / отрицательные суммы, тестовые пользователи) не попадают в `revenue_daily` | silver |
-| `is_promo_expired_at_use` — промокод применён после `expiry_date` | silver + `promo_expired_usage_daily` |
-| Forward-fill курсов: `max(rate_day) <= event_day` | `gold.revenue_daily` |
-| Late-arriving cancellations | `cancellations_clean` фильтрует по `date(ingested_at) = run_date`; gold-витрины по cancellations — `materialized='table'`, пересобираются целиком |
-| Базовая валюта — `TGRK` | dbt `vars.base_currency` |
-
-### Проверки качества
-
-- ~30 generic dbt-тестов (`unique`, `not_null`, `accepted_values`).
-- 2 singular: recon bronze vs silver count (drift > 5% → WARN) и `cancellations orphan_rate` (> 10% → WARN).
-- Запускаются шагом `dbt_test` в DAG. Ручной запуск — `dbt test --vars '{run_date: ...}'` в driver pod.
-
----
-
-## Диагностика
-
-| Симптом | Решение |
-|---|---|
-| `make check` сообщает «Wrong context» | `kubectl config use-context docker-desktop` |
-| Pod'ы HMS / Airflow в `Pending` или `CrashLoopBackOff` после `make up` | Подождать 5–10 минут (на arm64 через QEMU инициализация занимает много времени). Если не помогло — `kubectl -n data-platform logs <pod>` |
-| `make up` падает на secrets | Не создан `k8s/secrets.yaml`. Создать из `secrets.example.yaml` |
-| DAG на паузе | `make airflow-unpause` или кнопка в UI |
-| `bronze_s3_ingest` skipped целиком | `check_source_day` не нашёл `day=<ds>/` в S3 — это легальный исход. Проверить YC bucket вручную |
-| `transactions_medallion` упал на `bronze_ready` (timeout) | `bronze_s3_ingest` за тот же `ds` не отработал или skipped. Проверить его статус, при необходимости — clear + retrigger |
-| Одна из bronze-тасок упала | `kubectl -n spark-jobs logs <driver-pod>`; clear таски в Airflow — upsert идемпотентен, дубли не появятся |
-| Trino возвращает `TABLE_NOT_FOUND` | Первый ingest ещё не завершён. Дождаться `bronze_s3_ingest` за первый `ds` или выполнить `SHOW TABLES IN hudi.bronze` |
-| `make superset-init` падает с auth error | Superset ещё инициализируется. Повторить через минуту; проверить `kubectl -n data-platform get pod -l app=superset` |
-| `*.lab08.local` не открывается | Не выполнен `make hosts`. |
-| Образы не собрались | Запустить поштучно: `make spark-image` / `make airflow-image` / `make hms-image`, проанализировать лог |
-| Полный сброс | `make down` → `docker volume prune` → `make up` |
-
-Полезные команды:
-
-```bash
-make status                   # pod'ы по всем namespaces
-make diff                     # helmfile diff
-make verify-trino             # smoke-тест Trino и bronze.transactions
-kubectl -n spark-jobs get sparkapplication
-kubectl -n spark-jobs logs <driver-pod>
-```
+- **Изменение reference-данных задним числом** (юзера пометили как
+  тестового, у промокода поменялся `expiry_date`) silver/gold не
+  пересчитают автоматически — модели инкрементальные по `event_day`.
+  Нужен полный пересчёт: `dbt run --full-refresh` (или хотя бы пересчёт
+  затронутых дней через `--vars '{run_date: ...}'`).
+- **Бэкфил истории**: `kubectl -n data-platform exec deploy/airflow-scheduler -- airflow dags backfill bronze_s3_ingest -s YYYY-MM-DD -e YYYY-MM-DD`,
+  затем то же для `transactions_medallion`. Hudi upsert идемпотентен —
+  повторные дни не задвоятся.
+- **Перезапуск streaming-job** (`bronze-kafka-ingest`, `streaming-medallion`)
+  безопасен: checkpoint на S3 + upsert в Hudi по PK → возобновление с того
+  же offset, без дублей.
 
 ---
 
 ## Глоссарий
 
+Эксплуатационные термины. Data-термины (`composite_pk`, `cancellation_pk`,
+`gold.*_unified`, базовая валюта и т.д.) — в `04-data-modeling.md`.
+Архитектурные (HMS, Hudi, medallion) — в `01-detailed-architecture.md`.
+
 | Термин | Определение |
 |---|---|
-| **Lakehouse** | Архитектура, в которой DWH-возможности (ACID, схема, time-travel) реализованы поверх объектного хранилища |
-| **Hudi (CoW)** | Apache Hudi в режиме Copy-on-Write — каждая запись пересоздаёт parquet-файл |
-| **Medallion** | Подход bronze (raw) → silver (cleaned) → gold (business marts) |
-| **HMS** | Hive Metastore — каталог таблиц (schema, location) |
-| **MinIO** | S3-совместимое хранилище. В Lab08 — бакеты `lake/` и `checkpoints/` |
-| **Trino** | Distributed SQL engine, в Lab08 в режиме read-only с каталогом `hudi` |
-| **Superset** | BI-инструмент, дашборды поверх Trino |
 | **SparkApplication** | CRD `sparkoperator.k8s.io/v1beta2` от Kubeflow Spark Operator |
-| **Streaming SparkApp** | Долгоживущий `SparkApplication` (`restartPolicy: Always`): `bronze-kafka-ingest` (Kafka → bronze) и `streaming-medallion` (bronze → `gold.*_live`) |
+| **Streaming SparkApp** | Долгоживущий `SparkApplication` (`restartPolicy: Always`): `bronze-kafka-ingest`, `streaming-medallion` |
 | **Batch SparkApp** | Эфемерный `SparkApplication` (`restartPolicy: Never`), создаётся Airflow на каждую задачу: bronze S3 batch, reference, dbt |
-| **dbt-spark (session)** | Адаптер dbt, использующий уже сконфигурированный SparkSession в driver pod |
-| **composite_pk** | `concat_ws('|', transaction_id, created_at, user_id)` — record key Hudi для транзакций, компенсирует дубли |
-| **`_ingested_at`** | Технический timestamp, precombine-поле Hudi для dedup latest-wins |
-| **bronze.ingest_watermarks_\<source\>** | Per-source Hudi commit-log, один writer на shard (`ingest_watermarks_transactions`, `_cancellations`, `_exchange_rates`, `_kafka`). На S3-shards завязан Airflow-сенсор |
-| **TGRK** | Внутренний код базовой валюты конверсии, задан через `vars.base_currency` |
+| **bronze.ingest_watermarks_\<source\>** | Per-source Hudi commit-log, по одному writer на shard. Сенсор `bronze_ready` в `transactions_medallion` ждёт строки по `ds` во всех трёх шардах |
 | **PythonSensor (reschedule)** | Airflow-сенсор, освобождающий worker-slot между poke-итерациями |
-| **gold.\<x\>_unified** | Superset virtual dataset: UNION `gold.<x>` (settled, dbt) и `gold.<x>_live` (NRT, streaming), фильтр `event_day > max(settled)` |
-| **ShortCircuitOperator** | Пропускает downstream-таски, если callable вернул `False` |
+| **ShortCircuitOperator** | Пропускает downstream-таски, если callable вернул `False` (используется в `check_source_day`) |

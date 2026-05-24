@@ -19,3 +19,4 @@ make down
 - [Detailed Architecture](docs/01-detailed-architecture.md) — C4-диаграммы (Context / Container / Component), сценарии взаимодействия.
 - [User Guide](docs/02-user-guide.md) — пошаговые сценарии работы со стендом, FAQ, глоссарий.
 - [Deployment Guide](docs/03-deployment-guide.md) — требования, конфигурация, установка, upgrade / rollback / uninstall, troubleshooting.
+- [Data Modeling](docs/04-data-modeling.md) — бизнес-логика витрин, обработка грязных кейсов из данных, live-витрины, идемпотентность и пересчёт.
