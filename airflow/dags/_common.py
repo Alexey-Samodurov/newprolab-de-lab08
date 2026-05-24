@@ -49,7 +49,7 @@ SPARK_CONF: dict[str, str] = {
     "spark.dynamicAllocation.shuffleTracking.enabled": "true",
     "spark.dynamicAllocation.minExecutors": "1",
     "spark.dynamicAllocation.maxExecutors": "2",
-    "spark.dynamicAllocation.initialExecutors": "1",
+    "spark.dynamicAllocation.initialExecutors": "2",
     "spark.dynamicAllocation.executorIdleTimeout": "60s",
     "spark.dynamicAllocation.shuffleTracking.timeout": "120s",
 }
@@ -70,9 +70,9 @@ _AWS_ENV_REFS: dict[str, dict[str, str]] = {
 
 DRIVER_BASE: dict = {
     "cores": 1,
-    "coreLimit": "1100m",
-    "memory": "712m",
-    "memoryOverhead": "128m",
+    "coreLimit": "1200m",
+    "memory": "1g",
+    "memoryOverhead": "256m",
     "serviceAccount": "spark",
     "envSecretKeyRefs": _AWS_ENV_REFS,
     "volumeMounts": [
@@ -84,7 +84,7 @@ DRIVER_BASE: dict = {
 
 EXECUTOR_BASE: dict = {
     "cores": 1,
-    "coreLimit": "1100m",
+    "coreLimit": "1200m",
     "instances": 1,
     "memory": "1g",
     "memoryOverhead": "512m",

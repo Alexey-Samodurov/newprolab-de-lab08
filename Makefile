@@ -251,6 +251,7 @@ ingress:
 
 monitoring: monitoring-dashboards
 	kubectl apply -f k8s/monitoring/namespace.yaml >/dev/null
+	kubectl apply -f k8s/monitoring/service-statsd-ingest.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/servicemonitor-spark-operator.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/podmonitor-spark-applications.yaml >/dev/null
 	kubectl apply -f k8s/monitoring/servicemonitor-minio.yaml >/dev/null

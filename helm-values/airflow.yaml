@@ -38,7 +38,7 @@ extraEnv: |
   - name: AIRFLOW__METRICS__STATSD_ON
     value: "True"
   - name: AIRFLOW__METRICS__STATSD_HOST
-    value: "prometheus-statsd-exporter.monitoring.svc.cluster.local"
+    value: "10.96.252.252"
   - name: AIRFLOW__METRICS__STATSD_PORT
     value: "9125"
   - name: AIRFLOW__METRICS__STATSD_PREFIX
