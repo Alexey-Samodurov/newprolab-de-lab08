@@ -60,6 +60,7 @@ flowchart LR
 
     subgraph Transform["Transform (ns: spark-jobs)"]
         DBT[dbt SparkApp]
+        SM[streaming-medallion<br/>long-running]
     end
 
     subgraph Serve["Serve (ns: data-platform)"]
@@ -86,6 +87,8 @@ flowchart LR
     AF --> S3B
     DBT --> MinIO
     DBT --> HMS
+    SM --> MinIO
+    SM --> HMS
 
     Trino --> HMS
     Trino --> MinIO
@@ -153,7 +156,7 @@ flowchart LR
     HU --> HMS[HMS]
 ```
 
-**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. Идемпотентный upsert по `composite_pk` / `cancellation_pk` / `rate_pk`. Derived-колонки (`event_day`, `ingestion_day`, PK, `ingested_at`) считаются единым модулем `spark/utils/bronze_transforms.py` — общим с Kafka-writer'ом, чтобы партиционирование и ключи были байт-в-байт одинаковыми. Для transactions/cancellations выполняется cutover-merge с Kafka-резидуалом и `insert_overwrite` на партицию (S3 — источник истины для своих партиций). Cancellations партиционируются по `ingestion_day`, а не по `event_day` — late-arriving отмена не конкурирует с уже закрытой батч-партицией (см. ADR-004). Watermark пишет каждый источник в свой шард `bronze.ingest_watermarks_<source>` — single-writer per shard, без race-condition.
+**S3 batch (`bronze_s3_batch.py`)** — один источник за одни сутки. Идемпотентный upsert по `composite_pk` / `cancellation_pk` / `rate_pk`. Derived-колонки (`event_day`, `ingestion_day`, PK, `ingested_at`) считаются единым модулем `spark/utils/bronze_transforms.py` — общим с Kafka-writer'ом, чтобы партиционирование и ключи были байт-в-байт одинаковыми. Для transactions/cancellations выполняется cutover-merge с Kafka-резидуалом и `insert_overwrite` на партицию (S3 — источник истины для своих партиций). Cancellations партиционируются по `ingestion_day`, а не по `event_day` — late-arriving отмена не конкурирует с уже закрытой батч-партицией. Watermark пишет каждый источник в свой шард `bronze.ingest_watermarks_<source>` — single-writer per shard, без race-condition.
 
 **Reference (`bronze_reference_batch.py`)** — one-shot загрузка `users / test_users / promo_codes`.
 
@@ -259,9 +262,69 @@ Hudi-настройки: CoW + HMS sync, `compression=zstd`, `clean.policy=KEEP_
 
 **Проверки качества:** около 30 generic dbt-тестов (`unique`, `not_null`, `accepted_values`) в `_silver.yml`, `_gold.yml`, `sources.yml`, плюс 2 singular — recon bronze vs silver и orphan-rate cancellations.
 
+### Streaming medallion (`streaming_medallion.py`)
+
+Долгоживущий `SparkApplication` (`restartPolicy: Always`), не управляемый Airflow — деплоится helmfile-ом. Читает три бронзовых таблицы параллельно через **Hudi Incremental Source** (`readStream.format("hudi")`, `hoodie.datasource.query.type=incremental`), стартуя с последнего commit на момент запуска (при рестарте — от чекпойнта). Три независимых streaming-query, каждый с `trigger(processingTime="30 seconds")`.
+
+В `foreachBatch` каждая ветка:
+1. Читает `s3_high_watermark` из шарда `bronze.ingest_watermarks_<source>`.
+2. Фильтрует только «открытые» партиции: `event_day > s3_wm` для транзакций, `ingestion_day > s3_wm` для отмен. При `None` (cold-start) фильтр пропускается.
+3. **Транзакции:** broadcast-join с `users`, `test_users`, `promo_codes`; вычисляет DQ-флаги (`is_test_user`, `is_revenue_eligible`, `is_amount_invalid`); агрегирует в `gold.transactions_by_hour_live` и `gold.purchases_by_hour_live`.
+4. **Отмены:** агрегирует по `event_day + reason` в `gold.cancellations_summary_live`; атрибуция сирот (`orphan_cnt`, `avg_seconds_to_cancel`) — нули-заглушки, которые nightly dbt заполнит полными данными.
+5. **Курсы:** upsert в `gold.exchange_rates_latest` без watermark-фильтра (идемпотентно по `rate_pk`, `precombine=rate_ts`).
+
+Все выходные таблицы — Hudi CoW, `GLOBAL_SIMPLE` index, unpartitioned. Чекпойнты: `s3a://checkpoints/streaming-medallion/<table>`.
+
+```mermaid
+flowchart LR
+    subgraph Bronze["bronze (Hudi CoW)"]
+        BTX[transactions]
+        BCAN[cancellations]
+        BER[exchange_rates]
+    end
+
+    subgraph WM["ingest_watermarks_* (shards)"]
+        WMTx[ingest_watermarks_transactions]
+        WMCan[ingest_watermarks_cancellations]
+    end
+
+    subgraph SM["streaming_medallion.py — три query × trigger 30s"]
+        QTX["foreachBatch: transactions"]
+        QCAN["foreachBatch: cancellations"]
+        QER["foreachBatch: exchange_rates"]
+    end
+
+    subgraph Refs["bronze reference (broadcast)"]
+        USR[users / test_users / promo_codes]
+    end
+
+    subgraph GL["gold.*_live / *_latest (Hudi CoW, GLOBAL_SIMPLE)"]
+        GTBHL[transactions_by_hour_live]
+        GPBHL[purchases_by_hour_live]
+        GCANL[cancellations_summary_live]
+        GERL[exchange_rates_latest]
+    end
+
+    BTX -->|Hudi incremental| QTX
+    BCAN -->|Hudi incremental| QCAN
+    BER -->|Hudi incremental| QER
+
+    WMTx -->|s3_high_watermark| QTX
+    WMCan -->|s3_high_watermark| QCAN
+
+    USR -.->|broadcast join| QTX
+
+    QTX -->|event_day > s3_wm| GTBHL
+    QTX -->|event_day > s3_wm| GPBHL
+    QCAN -->|ingestion_day > s3_wm| GCANL
+    QER --> GERL
+```
+
 ### Lambda-unified BI-слой
 
-dbt держит settled-витрины за закрытые дни, streaming-medallion — `*_live` за свежие. Сшивает Superset через virtual dataset (`gold.*_unified`): UNION ALL settled и live, фильтр по `event_day > max(settled)`. Cutover автоматический. SQL в `superset/init_dashboards/datasets.py`. Не dbt view, потому что Trino-Hudi коннектор Hive views не читает.
+dbt владеет **settled-витринами** (`gold.*`) за закрытые дни; streaming-medallion — **live-витринами** (`gold.*_live` / `gold.exchange_rates_latest`) за открытые партиции today/today-1. Superset сшивает оба слоя через **virtual datasets** с суффиксом `_unified`, хранящие UNION ALL.
+
+Как только dbt закрывает день, граница `max(event_day)` сдвигается и live-строки за этот день вытесняются settled-результатом.
 
 ---
 
@@ -327,4 +390,41 @@ sequenceDiagram
     T->>M: GET parquet
     M-->>T: rows
     T-->>SS: result
+```
+
+### NRT-поток: Kafka → bronze → gold.*_live
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant KFK as Kafka
+    participant KI as bronze_kafka_ingest.py
+    participant WM as ingest_watermarks_*
+    participant BRZ as bronze.*
+    participant DLQ as bronze_dlq.late_events
+    participant SM as streaming_medallion.py
+    participant GL as gold.*_live
+    participant SS as Superset
+
+    loop trigger 15 s
+        KFK->>KI: micro-batch (≤ 10 000 msg)
+        KI->>WM: read_s3_high_watermark(table)
+        alt partition_value > s3_wm (on-time)
+            KI->>BRZ: write_hudi upsert (SIMPLE / GLOBAL_SIMPLE)
+        else partition_value ≤ s3_wm (late)
+            KI-->>DLQ: route to bronze_dlq.late_events
+        end
+        KI->>WM: write kafka watermark (offset)
+    end
+
+    loop trigger 30 s
+        BRZ-->>SM: Hudi Incremental Source (new commits only)
+        SM->>WM: read_s3_high_watermark(table)
+        SM->>SM: filter open partitions (event_day > s3_wm)
+        SM->>SM: broadcast join refs + DQ flags
+        SM->>GL: write_hudi upsert (GLOBAL_SIMPLE, unpartitioned)
+    end
+
+    SS->>GL: UNION ALL via *_unified virtual dataset
+    Note over SS,GL: cutover автоматический по max(event_day) dbt-settled
 ```
